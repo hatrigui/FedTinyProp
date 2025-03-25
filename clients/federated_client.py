@@ -18,7 +18,7 @@ class FederatedClient(fl.client.NumPyClient):
         self.device = device
         self.model = model.to(device)
         self.train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
-        self.test_data = test_data  # Optionally pass a test dataset.
+        self.test_data = test_data  
         if test_data is not None:
             self.test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
         self.optimizer = Adam(self.model.parameters(), lr=0.001)

@@ -1,3 +1,12 @@
+from clients.federated_client import FederatedClient
+from models.model import get_tinyprop_model
+from torch.utils.data import DataLoader
+import torch
+from models.model import get_tinyprop_model
+import torch
+
+
+
 def weighted_aggregate_models(model_list, dataset_sizes, model_name):
     """
     Aggregate models by averaging their parameters, weighted by dataset size.
@@ -7,9 +16,7 @@ def weighted_aggregate_models(model_list, dataset_sizes, model_name):
         dataset_sizes: List of integers (length of each client's dataset).
         model_name: e.g., 'mnist'
     """
-    from models.model import get_tinyprop_model
-    import torch
-
+    
     # Create the same model architecture to combine weights into
     global_model = get_tinyprop_model(model_name)
     global_dict = global_model.state_dict()
@@ -28,10 +35,6 @@ def weighted_aggregate_models(model_list, dataset_sizes, model_name):
 
 
 def weighted_federated_training(client_datasets, model_name, testset, rounds=5, device="cpu"):
-    from clients.federated_client import FederatedClient
-    from models.model import get_tinyprop_model
-    from torch.utils.data import DataLoader
-    import torch
 
     # 1) Compute each client's dataset size
     dataset_sizes = [len(ds) for ds in client_datasets]
