@@ -11,7 +11,7 @@ class FederatedClientWithFedProx(FederatedClient):
     def set_global_model(self, global_model):
         self.global_model = global_model
 
-    def train(self, num_epochs=1):
+    def train(self, num_epochs=3):
         self.model.train()
         global_params = list(self.global_model.parameters())
         for _ in range(num_epochs):
