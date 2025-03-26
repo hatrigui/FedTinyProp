@@ -1,8 +1,18 @@
 import torch
 from models.model import get_tinyprop_model
 
-def weighted_aggregate(models, dataset_sizes, model_name, tinyprop_params):
+
+def weighted_aggregate(
+    models,
+    model_name,
+    tinyprop_params,
+    dataset_sizes=None
+):
+    if dataset_sizes is None:
+        raise ValueError("Weighted aggregator needs dataset_sizes")
+
     
+
     global_model = get_tinyprop_model(model_name, tinyprop_params)
     global_dict = global_model.state_dict()
 

@@ -14,12 +14,16 @@ def federated_training(
     rounds=5,
     device="cpu"
 ):
-    
     if aggregator_kwargs is None:
         aggregator_kwargs = {}
 
+    if "dataset_sizes" not in aggregator_kwargs:
+        aggregator_kwargs["dataset_sizes"] = [len(ds) for ds in client_datasets]
+
     clients = [
-        FederatedClient(get_tinyprop_model(model_name, tinyprop_params), dataset, device=device)
+        FederatedClient(
+            get_tinyprop_model(model_name, tinyprop_params), dataset, device=device
+        )
         for dataset in client_datasets
     ]
 
@@ -27,11 +31,8 @@ def federated_training(
     test_loader = DataLoader(testset, batch_size=32, shuffle=False)
     test_accs = []
 
-    if "dataset_sizes" in aggregator_kwargs:
-        aggregator_kwargs["dataset_sizes"] = [len(ds) for ds in client_datasets]
-
     for rnd in range(rounds):
-        print(f"\nRound {rnd+1}/{rounds}")
+        print(f"Round {rnd+1}/{rounds}")
         global_params = global_model.state_dict()
         client_models = []
 
@@ -44,7 +45,7 @@ def federated_training(
             client_models,
             model_name,
             tinyprop_params,
-            **aggregator_kwargs
+            **aggregator_kwargs  
         )
 
         global_model.eval()
@@ -62,4 +63,3 @@ def federated_training(
         print(f"Test Accuracy: {acc:.4f}")
 
     return global_model, test_accs
-
