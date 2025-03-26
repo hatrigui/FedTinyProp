@@ -6,15 +6,6 @@ import flwr as fl
 
 class FederatedClient(fl.client.NumPyClient):
     def __init__(self, model, train_data, test_data=None, device="cpu"):
-        """
-        Initialize the FederatedClient.
-        
-        Args:
-            model: A PyTorch model.
-            train_data: Training dataset (or subset) for this client.
-            test_data: Optional test dataset to be used during evaluation.
-            device (str): Device to use (e.g., "cpu" or "cuda").
-        """
         self.device = device
         self.model = model.to(device)
         self.train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
