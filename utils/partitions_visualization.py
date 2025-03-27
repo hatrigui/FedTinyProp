@@ -2,10 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 def plot_class_distribution(client_datasets, dataset, title, num_classes=10):
-    """
-    Plot the class distribution for each client's dataset.
     
-    """
     distributions = []
     for ds in client_datasets:
         indices = ds.indices if hasattr(ds, 'indices') else list(range(len(ds)))

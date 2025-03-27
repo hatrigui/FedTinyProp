@@ -6,7 +6,7 @@ import flwr as fl
 
 class FederatedClient(fl.client.NumPyClient):
     def __init__(self, model, train_data, test_data=None, device="cpu"):
-        
+       
         self.device = device
         self.model = model.to(device)
         self.train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
@@ -15,6 +15,10 @@ class FederatedClient(fl.client.NumPyClient):
             self.test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
         self.optimizer = SGD(self.model.parameters(), lr=0.01, momentum=0.9)
         self.criterion = nn.CrossEntropyLoss()
+        self.last_flops = 0.0
+        self.last_mem = 0.0
+        self.last_comm = 0.0
+        self.last_sparsity = 0.0
 
     def get_parameters(self):
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
@@ -27,6 +31,18 @@ class FederatedClient(fl.client.NumPyClient):
         self.model.load_state_dict(new_state_dict)
 
     def train(self, num_epochs=1):
+        self.last_flops = 0.0
+        self.last_mem = 0.0
+        self.last_comm = 0.0
+        self.last_sparsity = 0.0
+        full_flops_per_batch = 1e6  
+
+        total_nonzero_grads = 0
+        total_grads = 0
+        total_changed_params = 0
+
+        peak_nonzero = 0
+
         self.model.train()
         for _ in range(num_epochs):
             for images, labels in self.train_loader:
@@ -35,7 +51,33 @@ class FederatedClient(fl.client.NumPyClient):
                 outputs = self.model(images)
                 loss = self.criterion(outputs, labels)
                 loss.backward()
+
+                nonzero = 0
+                total_elems = 0
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        g = param.grad.data
+                        nonzero += (g.abs() > 1e-9).sum().item()
+                        total_elems += g.numel()
+                total_nonzero_grads += nonzero
+                total_grads += total_elems
+
+                changed_params = nonzero 
+                total_changed_params += changed_params
+
                 self.optimizer.step()
+
+                fraction_sparsity = nonzero / (total_elems if total_elems > 0 else 1)
+                self.last_flops += full_flops_per_batch * fraction_sparsity
+
+                if nonzero > peak_nonzero:
+                    peak_nonzero = nonzero
+
+        if total_grads > 0:
+            self.last_sparsity = total_nonzero_grads / total_grads
+        self.last_mem = peak_nonzero * 4.0  
+
+        self.last_comm = total_changed_params * 4.0 
 
     def local_evaluate(self, data_loader):
         self.model.eval()
