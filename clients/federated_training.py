@@ -1,8 +1,7 @@
 import torch
-from models.model import get_tinyprop_model
 from torch.utils.data import DataLoader
 from clients.federated_client import FederatedClient
-
+from models.model import get_tinyprop_model
 
 def federated_training(
     client_datasets,
@@ -11,8 +10,9 @@ def federated_training(
     tinyprop_params,
     aggregator_fn,
     aggregator_kwargs=None,
-    rounds=5,
-    device="cpu"
+    rounds=200,       
+    device="cpu",
+    local_epochs=1    
 ):
     if aggregator_kwargs is None:
         aggregator_kwargs = {}
@@ -22,7 +22,9 @@ def federated_training(
 
     clients = [
         FederatedClient(
-            get_tinyprop_model(model_name, tinyprop_params), dataset, device=device
+            get_tinyprop_model(model_name, tinyprop_params),
+            dataset,
+            device=device
         )
         for dataset in client_datasets
     ]
@@ -32,20 +34,20 @@ def federated_training(
     test_accs = []
 
     for rnd in range(rounds):
-        print(f"Round {rnd+1}/{rounds}")
+        print(f"\nRound {rnd+1}/{rounds}")
         global_params = global_model.state_dict()
         client_models = []
 
         for client in clients:
             client.set_parameters([val.cpu().numpy() for val in global_params.values()])
-            client.train(num_epochs=1)
+            client.train(num_epochs=local_epochs)
             client_models.append(client.model)
 
         global_model = aggregator_fn(
             client_models,
             model_name,
             tinyprop_params,
-            **aggregator_kwargs  
+            **aggregator_kwargs
         )
 
         global_model.eval()

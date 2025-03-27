@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.tinyProp import TinyPropParams, TinyPropConv2d, TinyPropLinear
 
-tinyprop_params = TinyPropParams(S_min=0.1, S_max=0.9, zeta=0.95, number_of_layers=2)
+DEFAULT_PARAMS = TinyPropParams(S_min=0.05, S_max=0.5, zeta=0.25, number_of_layers=2)
 
 class TinyPropCNN(nn.Module):
-    def __init__(self, tinyprop_params: TinyPropParams):
+    def __init__(self, tinyprop_params: TinyPropParams = DEFAULT_PARAMS):
         super(TinyPropCNN, self).__init__()
         self.conv1 = TinyPropConv2d(1, 32, kernel_size=3, tinyPropParams=tinyprop_params, layer_number=1, padding=1)
         self.conv2 = TinyPropConv2d(32, 64, kernel_size=3, tinyPropParams=tinyprop_params, layer_number=1, padding=1)
@@ -23,9 +23,9 @@ class TinyPropCNN(nn.Module):
         return x
 
 
-class TinyPropCNN_CIFAR(nn.Module):
-    def __init__(self, tinyprop_params: TinyPropParams):
-        super(TinyPropCNN_CIFAR, self).__init__()
+class TinyPropCNN_CIFAR10(nn.Module):
+    def __init__(self, tinyprop_params: TinyPropParams = DEFAULT_PARAMS):
+        super(TinyPropCNN_CIFAR10, self).__init__()
         self.conv1 = TinyPropConv2d(3, 32, kernel_size=3, tinyPropParams=tinyprop_params, layer_number=1, padding=1)
         self.conv2 = TinyPropConv2d(32, 64, kernel_size=3, tinyPropParams=tinyprop_params, layer_number=1, padding=1)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
@@ -42,7 +42,7 @@ class TinyPropCNN_CIFAR(nn.Module):
 
 
 class TinyPropCNN_CIFAR100(nn.Module):
-    def __init__(self, tinyprop_params: TinyPropParams):
+    def __init__(self, tinyprop_params: TinyPropParams = DEFAULT_PARAMS):
         super(TinyPropCNN_CIFAR100, self).__init__()
         self.conv1 = TinyPropConv2d(3, 32, kernel_size=3, tinyPropParams=tinyprop_params, layer_number=1, padding=1)
         self.conv2 = TinyPropConv2d(32, 64, kernel_size=3, tinyPropParams=tinyprop_params, layer_number=1, padding=1)
@@ -72,7 +72,7 @@ def get_tinyprop_model(dataset_name, tinyprop_params=None):
     if dataset_name in ['mnist', 'fashionmnist']:
         return TinyPropCNN(tinyprop_params)
     elif dataset_name == 'cifar10':
-        return TinyPropCNN_CIFAR(tinyprop_params)
+        return TinyPropCNN_CIFAR10(tinyprop_params)
     elif dataset_name == 'cifar100':
         return TinyPropCNN_CIFAR100(tinyprop_params)
     else:

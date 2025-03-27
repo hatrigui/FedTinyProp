@@ -1,18 +1,19 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim import Adam
+from torch.optim import SGD
 import flwr as fl
 
 class FederatedClient(fl.client.NumPyClient):
     def __init__(self, model, train_data, test_data=None, device="cpu"):
+        
         self.device = device
         self.model = model.to(device)
         self.train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
-        self.test_data = test_data  
+        self.test_data = test_data
         if test_data is not None:
             self.test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
-        self.optimizer = Adam(self.model.parameters(), lr=0.001)
+        self.optimizer = SGD(self.model.parameters(), lr=0.01, momentum=0.9)
         self.criterion = nn.CrossEntropyLoss()
 
     def get_parameters(self):
@@ -56,8 +57,7 @@ class FederatedClient(fl.client.NumPyClient):
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         if hasattr(self, "test_loader"):
-            test_loader = self.test_loader
+            acc = self.local_evaluate(self.test_loader)
+            return float(acc), len(self.test_loader.dataset), {}
         else:
             raise ValueError("No test dataset provided for evaluation.")
-        accuracy = self.local_evaluate(test_loader)
-        return float(accuracy), len(test_loader.dataset), {}
