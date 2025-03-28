@@ -6,19 +6,24 @@ import flwr as fl
 
 class FederatedClient(fl.client.NumPyClient):
     def __init__(self, model, train_data, test_data=None, device="cpu"):
-       
         self.device = device
         self.model = model.to(device)
         self.train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
         self.test_data = test_data
         if test_data is not None:
             self.test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
+
         self.optimizer = SGD(self.model.parameters(), lr=0.01, momentum=0.9)
         self.criterion = nn.CrossEntropyLoss()
+
         self.last_flops = 0.0
         self.last_mem = 0.0
         self.last_comm = 0.0
         self.last_sparsity = 0.0
+
+        self.initial_grad_norm = 1e-9
+        self.did_init_grad = False
+        self.skip_threshold = 1e-4
 
     def get_parameters(self):
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
@@ -35,12 +40,11 @@ class FederatedClient(fl.client.NumPyClient):
         self.last_mem = 0.0
         self.last_comm = 0.0
         self.last_sparsity = 0.0
-        full_flops_per_batch = 1e6  
 
+        full_flops_per_batch = 1e6  
         total_nonzero_grads = 0
         total_grads = 0
         total_changed_params = 0
-
         peak_nonzero = 0
 
         self.model.train()
@@ -52,17 +56,43 @@ class FederatedClient(fl.client.NumPyClient):
                 loss = self.criterion(outputs, labels)
                 loss.backward()
 
+                total_gnorm = 0.0
+                total_params = 0
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        g = param.grad.data
+                        total_gnorm += g.norm(2).item()
+                        total_params += 1
+
+                if total_params > 0:
+                    avg_gnorm = total_gnorm / total_params
+                else:
+                    avg_gnorm = 0.0
+
+                if not self.did_init_grad:
+                    self.initial_grad_norm = max(1e-9, avg_gnorm)
+                    self.did_init_grad = True
+
+                if total_gnorm < self.skip_threshold:
+                    continue
+
+                phi = avg_gnorm / self.initial_grad_norm
+
+                self.model.adaptive_ratio = phi
+
                 nonzero = 0
                 total_elems = 0
                 for param in self.model.parameters():
                     if param.grad is not None:
                         g = param.grad.data
-                        nonzero += (g.abs() > 1e-9).sum().item()
+                        nz = (g.abs() > 1e-9).sum().item()
+                        nonzero += nz
                         total_elems += g.numel()
+
                 total_nonzero_grads += nonzero
                 total_grads += total_elems
 
-                changed_params = nonzero 
+                changed_params = nonzero
                 total_changed_params += changed_params
 
                 self.optimizer.step()
@@ -76,8 +106,7 @@ class FederatedClient(fl.client.NumPyClient):
         if total_grads > 0:
             self.last_sparsity = total_nonzero_grads / total_grads
         self.last_mem = peak_nonzero * 4.0  
-
-        self.last_comm = total_changed_params * 4.0 
+        self.last_comm = total_changed_params * 4.0
 
     def local_evaluate(self, data_loader):
         self.model.eval()

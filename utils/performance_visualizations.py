@@ -1,4 +1,3 @@
-# file: utils/visualization.py
 
 import matplotlib.pyplot as plt
 
@@ -62,3 +61,47 @@ def plot_all_strategies(all_results):
         plt.suptitle(f"{strategy.upper()} - Federated Training Metrics", fontsize=16)
 
         plot_fed_metrics(acc, flops, mem, comm, sparsity)
+        
+
+def plot_all_partitions_in_one_figure(all_results):
+
+
+    metric_keys = ["acc", "flops", "mem", "comm", "sparsity"]
+    metric_titles = ["Accuracy", "FLOPs", "Memory", "Communication", "Sparsity"]
+    fig, axs = plt.subplots(2, 3, figsize=(12, 8))
+    fig.suptitle("Federated Training Metrics by Partition Strategy", fontsize=16)
+    axs_flat = axs.ravel()
+
+    for i, key in enumerate(metric_keys):
+        ax = axs_flat[i]  
+        ax.set_title(metric_titles[i])
+        for strategy, data in all_results.items():
+            if key not in data:
+                continue 
+
+            y_values = data[key]
+            rounds_axis = range(1, len(y_values) + 1)
+
+            if key == "sparsity":
+                y_values = [val * 100 for val in y_values]
+            ax.plot(rounds_axis, y_values, label=strategy)
+
+        ax.set_xlabel("Round")
+        if key == "acc":
+            ax.set_ylabel("Accuracy")
+        elif key == "flops":
+            ax.set_ylabel("Approx FLOPs")
+        elif key == "mem":
+            ax.set_ylabel("Memory (bytes)")
+        elif key == "comm":
+            ax.set_ylabel("Comm (bytes)")
+        elif key == "sparsity":
+            ax.set_ylabel("Non-zero fraction (%)")
+
+        ax.legend()
+
+    axs_flat[-1].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+

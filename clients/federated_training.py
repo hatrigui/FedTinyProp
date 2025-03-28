@@ -14,9 +14,8 @@ def federated_training(
     rounds=200,
     device="cpu",
     local_epochs=1,
-    visualize=True
+    early_stopping_patience=5 
 ):
-   
     if aggregator_kwargs is None:
         aggregator_kwargs = {}
 
@@ -40,6 +39,9 @@ def federated_training(
     mem_list      = []
     comm_list     = []
     sparsity_list = []
+
+    best_acc = 0
+    early_stopping_counter = 0
 
     for rnd in range(rounds):
         print(f"\nRound {rnd+1}/{rounds}")
@@ -90,7 +92,16 @@ def federated_training(
         print(f"Test Accuracy: {acc:.4f}")
         print(f"[Compute] round_flops={round_flops:.2f}, [Mem] peak={round_mem} bytes, [Comm] {round_comm} bytes, [Sparsity] {mean_sparsity*100:.2f}%")
 
-    if visualize:
-        plot_fed_metrics(accuracy_list, flops_list, mem_list, comm_list, sparsity_list)
+        # Early stopping logic
+        if acc > best_acc:
+            best_acc = acc
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+
+        if early_stopping_counter >= early_stopping_patience:
+            print(f"Early stopping triggered after {rnd+1} rounds. Best accuracy: {best_acc:.4f}")
+            break
+
 
     return global_model, accuracy_list, flops_list, mem_list, comm_list, sparsity_list

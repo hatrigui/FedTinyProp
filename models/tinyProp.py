@@ -5,9 +5,7 @@ from typing import Union
 from torch.nn.common_types import _size_2_t
 
 class TinyPropParams:
-    """
-    Stores global parameters for TinyProp gradient sparsification.
-    """
+    
     def __init__(self, S_min: float, S_max: float, zeta: float, number_of_layers: int):
         self.S_min = S_min
         self.S_max = S_max
@@ -15,9 +13,7 @@ class TinyPropParams:
         self.number_of_layers = number_of_layers
 
 class TinyPropLayer:
-    """
-    Mixin for layers using TinyProp.
-    """
+ 
     def __init__(self, layerPosition: int):
         self.layerPosition = layerPosition
         self.Y_max = 1e-8
@@ -30,24 +26,45 @@ class TinyPropLayer:
         return (params.S_min + Y * (params.S_max - params.S_min) / self.Y_max) * (params.zeta ** self.layerPosition)
 
     def selectGradients(self, grad_output: torch.Tensor, params: TinyPropParams):
+        if grad_output.size(1) == 0:
+            print("Warning: grad_output has zero dimension. Skipping top-k selection.")
+        
+            empty_indices = torch.empty((2, 0), dtype=torch.int64, device=grad_output.device)
+            empty_values = torch.empty((0,), dtype=grad_output.dtype, device=grad_output.device)
+            return empty_indices, empty_values
+        
+        ratio_from_client = getattr(self, 'adaptive_ratio', 1.0) 
+        
         Y = grad_output.abs().sum(dim=1)
         max_Y = torch.max(Y)
         if max_Y > self.Y_max:
             self.Y_max = max_Y.item()
-        bpr = self.BPR(params, Y)
+            
+        bpr = (params.S_min + Y*(params.S_max - params.S_min)/self.Y_max) * (params.zeta ** self.layerPosition)
+        bpr = bpr * ratio_from_client
+        bpr = torch.clamp(bpr, 0.0, 1.0)
+        
         K = torch.round(grad_output.size(1) * bpr)
         K = K.clamp(min=1, max=grad_output.size(1))
         self.miniBatchBpr += torch.mean(bpr).item()
         self.miniBatchK += torch.mean(K.float()).item()
         K = K.to(torch.int64)
-
+        
         idx_list = []
         val_list = []
         for batch, k in enumerate(K):
-            _, indices = grad_output[batch].abs().topk(k)
+            grad = grad_output[batch]
+            k = min(k.item(), grad.numel())  # extra safe
+            if k == 0:
+                continue  # skip if zero
+            _, indices = grad.abs().topk(k)
             batch_idx = torch.full_like(indices, batch)
             idx_list.append(torch.vstack((batch_idx, indices)))
-            val_list.append(torch.index_select(grad_output[batch], -1, indices))
+            val_list.append(torch.index_select(grad, -1, indices))
+            
+
+
+            
         indices_sparse = torch.hstack(idx_list)
         values_sparse = torch.cat(val_list)
         return indices_sparse, values_sparse
