@@ -117,16 +117,27 @@ class SparseConv2d(torch.autograd.Function):
         sparse_flat[indices[0], indices[1]] = values
         grad_output_masked = sparse_flat.view_as(grad_output).to(weight.device)
         if ctx.needs_input_grad[0]:
-            grad_input = F.conv_transpose2d(grad_output_masked, weight, None, ctx.stride, ctx.padding, groups=ctx.groups, dilation=ctx.dilation)
+            grad_input = torch.nn.grad.conv2d_input(
+                input.shape,
+                weight,
+                grad_output_masked,
+                stride=ctx.stride,
+                padding=ctx.padding,
+                dilation=ctx.dilation,
+                groups=ctx.groups
+            )
+
         if ctx.needs_input_grad[1]:
-            permuted_grad = grad_output_masked.permute(1, 0, 2, 3)
-            input_channels = torch.unbind(input, dim=1)
-            weight_grad_list = []
-            for channel in input_channels:
-                weight_grad_list.append(F.conv2d(channel, permuted_grad, None, ctx.stride, ctx.padding, groups=ctx.groups, dilation=ctx.dilation))
-            grad_weight = torch.stack(weight_grad_list, dim=0).permute(1, 0, 2, 3)
-        if bias is not None and ctx.needs_input_grad[2]:
-            grad_bias = grad_output_masked.sum(dim=(0,2,3))
+            grad_weight = torch.nn.grad.conv2d_weight(
+                input,
+                weight.shape,
+                grad_output_masked,
+                stride=ctx.stride,
+                padding=ctx.padding,
+                dilation=ctx.dilation,
+                groups=ctx.groups
+            )
+
         return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, None
 
 class TinyPropLinear(TinyPropLayer, nn.Linear):
