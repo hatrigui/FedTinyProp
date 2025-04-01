@@ -3,6 +3,8 @@ from torch.utils.data import DataLoader
 from clients.federated_client import FederatedClient
 from models.model import get_tinyprop_model
 from utils.performance_visualizations import plot_fed_metrics  
+from models.config import get_config
+
 
 def federated_training(
     client_datasets,
@@ -14,7 +16,8 @@ def federated_training(
     rounds=200,
     device="cpu",
     local_epochs=1,
-    early_stopping_patience=5 
+    early_stopping_patience=5,
+    early_stopping_delta=0.0001
 ):
     if aggregator_kwargs is None:
         aggregator_kwargs = {}
@@ -22,11 +25,14 @@ def federated_training(
     if "dataset_sizes" not in aggregator_kwargs:
         aggregator_kwargs["dataset_sizes"] = [len(ds) for ds in client_datasets]
 
+    config = get_config(model_name)
+
     clients = [
         FederatedClient(
             get_tinyprop_model(model_name, tinyprop_params),
             dataset,
-            device=device
+            device=device,
+            config=config
         )
         for dataset in client_datasets
     ]
@@ -53,6 +59,8 @@ def federated_training(
         round_comm  = 0.0
         round_sparsity = 0.0
 
+        local_steps = []
+
         for client in clients:
             client.set_parameters([val.cpu().numpy() for val in global_params.values()])
             client.train(num_epochs=local_epochs)
@@ -63,6 +71,10 @@ def federated_training(
                 round_mem = client.last_mem 
             round_comm     += client.last_comm
             round_sparsity += client.last_sparsity
+            local_steps.append(local_epochs)
+
+        aggregator_kwargs["global_params"] = global_params
+        aggregator_kwargs["local_steps"] = local_steps
 
         global_model = aggregator_fn(
             client_models,
@@ -92,8 +104,8 @@ def federated_training(
         print(f"Test Accuracy: {acc:.4f}")
         print(f"[Compute] round_flops={round_flops:.2f}, [Mem] peak={round_mem} bytes, [Comm] {round_comm} bytes, [Sparsity] {mean_sparsity*100:.2f}%")
 
-        # Early stopping logic
-        if acc > best_acc:
+        # Early stopping logic with delta
+        if acc > best_acc + early_stopping_delta:
             best_acc = acc
             early_stopping_counter = 0
         else:
@@ -102,6 +114,5 @@ def federated_training(
         if early_stopping_counter >= early_stopping_patience:
             print(f"Early stopping triggered after {rnd+1} rounds. Best accuracy: {best_acc:.4f}")
             break
-
 
     return global_model, accuracy_list, flops_list, mem_list, comm_list, sparsity_list

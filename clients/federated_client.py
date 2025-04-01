@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim import SGD
+from torch.optim import SGD, Adam
 import flwr as fl
+from models.config import get_config
 
 class FederatedClient(fl.client.NumPyClient):
-    def __init__(self, model, train_data, test_data=None, device="cpu"):
+    def __init__(self, model, train_data, test_data=None, device="cpu", dataset_name="mnist"):
         self.device = device
         self.model = model.to(device)
         self.train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
@@ -13,7 +14,14 @@ class FederatedClient(fl.client.NumPyClient):
         if test_data is not None:
             self.test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
 
-        self.optimizer = SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+        # Load dataset-specific config
+        cfg = get_config(dataset_name)
+
+        if cfg["optimizer"] == "sgd":
+            self.optimizer = SGD(self.model.parameters(), lr=cfg["lr"], momentum=cfg["momentum"])
+        else:
+            self.optimizer = Adam(self.model.parameters(), lr=cfg["lr"])
+
         self.criterion = nn.CrossEntropyLoss()
 
         self.last_flops = 0.0
@@ -23,7 +31,8 @@ class FederatedClient(fl.client.NumPyClient):
 
         self.initial_grad_norm = 1e-9
         self.did_init_grad = False
-        self.skip_threshold = 1e-4
+        self.skip_threshold = cfg["skip_threshold"]
+        self.full_flops_per_batch = cfg["full_flops_per_batch"]
 
     def get_parameters(self):
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
@@ -41,7 +50,6 @@ class FederatedClient(fl.client.NumPyClient):
         self.last_comm = 0.0
         self.last_sparsity = 0.0
 
-        full_flops_per_batch = 1e6  
         total_nonzero_grads = 0
         total_grads = 0
         total_changed_params = 0
@@ -98,14 +106,14 @@ class FederatedClient(fl.client.NumPyClient):
                 self.optimizer.step()
 
                 fraction_sparsity = nonzero / (total_elems if total_elems > 0 else 1)
-                self.last_flops += full_flops_per_batch * fraction_sparsity
+                self.last_flops += self.full_flops_per_batch * fraction_sparsity
 
                 if nonzero > peak_nonzero:
                     peak_nonzero = nonzero
 
         if total_grads > 0:
             self.last_sparsity = total_nonzero_grads / total_grads
-        self.last_mem = peak_nonzero * 4.0  
+        self.last_mem = peak_nonzero * 4.0
         self.last_comm = total_changed_params * 4.0
 
     def local_evaluate(self, data_loader):
