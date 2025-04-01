@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import SGD, Adam
 import flwr as fl
-from models.config import get_config
+from models.config import get_tinyprop_config
 
 class FederatedClient(fl.client.NumPyClient):
     def __init__(self, model, train_data, test_data=None, device="cpu", dataset_name="mnist"):
@@ -15,12 +15,14 @@ class FederatedClient(fl.client.NumPyClient):
             self.test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
 
         # Load dataset-specific config
-        cfg = get_config(dataset_name)
+        cfg = get_tinyprop_config(dataset_name)
 
-        if cfg["optimizer"] == "sgd":
-            self.optimizer = SGD(self.model.parameters(), lr=cfg["lr"], momentum=cfg["momentum"])
+        opt_cfg = cfg["optimizer"]
+        if opt_cfg["type"] == "sgd":
+            self.optimizer = SGD(self.model.parameters(), lr=opt_cfg["lr"], momentum=opt_cfg["momentum"])
         else:
-            self.optimizer = Adam(self.model.parameters(), lr=cfg["lr"])
+            self.optimizer = Adam(self.model.parameters(), lr=opt_cfg["lr"])
+
 
         self.criterion = nn.CrossEntropyLoss()
 

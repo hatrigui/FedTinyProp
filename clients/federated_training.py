@@ -3,7 +3,7 @@ from torch.utils.data import DataLoader
 from clients.federated_client import FederatedClient
 from models.model import get_tinyprop_model
 from utils.performance_visualizations import plot_fed_metrics  
-from models.config import get_config
+from models.config import get_tinyprop_config
 
 
 def federated_training(
@@ -25,14 +25,14 @@ def federated_training(
     if "dataset_sizes" not in aggregator_kwargs:
         aggregator_kwargs["dataset_sizes"] = [len(ds) for ds in client_datasets]
 
-    config = get_config(model_name)
+    config = get_tinyprop_config(model_name)
 
     clients = [
         FederatedClient(
             get_tinyprop_model(model_name, tinyprop_params),
             dataset,
             device=device,
-            config=config
+             dataset_name=model_name
         )
         for dataset in client_datasets
     ]
