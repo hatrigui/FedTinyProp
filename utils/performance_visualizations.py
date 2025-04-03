@@ -1,107 +1,92 @@
-
+import pandas as pd
 import matplotlib.pyplot as plt
 
-def plot_fed_metrics(acc_list, flops_list, mem_list, comm_list, sparsity_list):
-    
-    rounds = range(1, len(acc_list)+1)
+def plot_fedtinyprop_metrics(csv_path, title_prefix=""):
+    df = pd.read_csv(csv_path)
+    rounds = df["round"]
 
-    plt.figure(figsize=(12,8))
+    plt.figure(figsize=(16, 20))
 
-    plt.subplot(2,3,1)
-    plt.plot(rounds, acc_list, label='Accuracy')
-    plt.title("Accuracy vs Rounds")
+    # 1. Accuracy
+    plt.subplot(4, 2, 1)
+    plt.plot(rounds, df["accuracy"], marker="o", label="Accuracy")
+    plt.title(f"{title_prefix} - Test Accuracy")
     plt.xlabel("Round")
     plt.ylabel("Accuracy")
+    plt.grid(True)
 
-    plt.subplot(2,3,2)
-    plt.plot(rounds, flops_list, label='FLOPs', color='orange')
-    plt.title("FLOPs vs Rounds")
+    # 2. Sparsity
+    plt.subplot(4, 2, 2)
+    plt.plot(rounds, df["sparsity"], marker="o", color="green", label="Sparsity")
+    plt.title(f"{title_prefix} - Model Update Sparsity")
     plt.xlabel("Round")
-    plt.ylabel("Approx FLOPs")
+    plt.ylabel("Sparsity")
+    plt.grid(True)
 
-    plt.subplot(2,3,3)
-    plt.plot(rounds, mem_list, label='Mem Usage', color='green')
-    plt.title("Memory vs Rounds")
+    # 3. Effective Compute Ratio
+    plt.subplot(4, 2, 3)
+    plt.plot(rounds, df["effective_compute_ratio"], marker="o", color="purple", label="Effective Compute Ratio")
+    plt.title(f"{title_prefix} - Effective Computation")
     plt.xlabel("Round")
-    plt.ylabel("Bytes")
+    plt.ylabel("Compute Ratio")
+    plt.grid(True)
 
-    plt.subplot(2,3,4)
-    plt.plot(rounds, comm_list, label='Comm Bytes', color='red')
-    plt.title("Comm Cost vs Rounds")
+    # 4. Skipped Batches
+    plt.subplot(4, 2, 4)
+    plt.plot(rounds, df["skipped_batches"], marker="o", color="orange", label="Skipped Batches")
+    plt.title(f"{title_prefix} - Skipped Batches per Round")
     plt.xlabel("Round")
-    plt.ylabel("Bytes")
+    plt.ylabel("Skipped Batches")
+    plt.grid(True)
 
-    plt.subplot(2,3,5)
-    plt.plot(rounds, [s*100 for s in sparsity_list], label='Sparsity %', color='purple')
-    plt.title("Sparsity vs Rounds")
+    # 5. Communication Cost
+    plt.subplot(4, 2, 5)
+    plt.plot(rounds, df["communication_bytes"] / 1e6, marker="o", color="red", label="Comm MB")
+    plt.title(f"{title_prefix} - Communication Cost (MB)")
     plt.xlabel("Round")
-    plt.ylabel("Non-zero fraction (%)")
+    plt.ylabel("MB Sent")
+    plt.grid(True)
+
+    # 6. Compression Ratio
+    plt.subplot(4, 2, 6)
+    plt.plot(rounds, df["compression_ratio"], marker="o", color="teal", label="Compression Ratio")
+    plt.title(f"{title_prefix} - Delta Compression Ratio")
+    plt.xlabel("Round")
+    plt.ylabel("Ratio")
+    plt.grid(True)
+
+    # 7. Gradient Norm & Phi
+    plt.subplot(4, 2, 7)
+    plt.plot(rounds, df["avg_grad_norm"], label="Avg Grad Norm", marker="o")
+    plt.plot(rounds, df["avg_phi"], label="Avg Phi", marker="x")
+    plt.title(f"{title_prefix} - Grad Norm & Adaptive Ratio (Phi)")
+    plt.xlabel("Round")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.grid(True)
 
     plt.tight_layout()
     plt.show()
+    
+import pandas as pd
+import matplotlib.pyplot as plt
 
+def plot_metric_comparison_across_partitions(csv_paths_dict, metric="accuracy", title=None, ylabel=None):
+   
+    plt.figure(figsize=(10, 6))
 
-def plot_all_strategies(all_results):
-    for strategy, metrics in all_results.items():
-        print(f"\nPlotting results for partition strategy: {strategy.upper()}")
-        acc = metrics["acc"]
-        flops = metrics["flops"]
-        mem = metrics["mem"]
-        comm = metrics["comm"]
-        sparsity = metrics["sparsity"]
+    for partition_name, csv_path in csv_paths_dict.items():
+        df = pd.read_csv(csv_path)
+        if metric not in df.columns:
+            print(f"[WARN] '{metric}' not found in {csv_path}, skipping...")
+            continue
+        plt.plot(df["round"], df[metric], label=partition_name, marker='o', linewidth=2)
 
-        final_acc     = acc[-1] if acc else 0
-        final_flops   = flops[-1] if flops else 0
-        final_mem     = mem[-1] if mem else 0
-        final_comm    = comm[-1] if comm else 0
-        final_spars   = sparsity[-1] * 100 if sparsity else 0
-        print(f"Final Accuracy: {final_acc:.4f}, FLOPs: {final_flops:.2f}, Mem: {final_mem:.2f} bytes, Comm: {final_comm:.2f} bytes, Sparsity: {final_spars:.2f}%")
-
-        plt.figure(figsize=(12,8))
-        plt.suptitle(f"{strategy.upper()} - Federated Training Metrics", fontsize=16)
-
-        plot_fed_metrics(acc, flops, mem, comm, sparsity)
-        
-
-def plot_all_partitions_in_one_figure(all_results):
-
-
-    metric_keys = ["acc", "flops", "mem", "comm", "sparsity"]
-    metric_titles = ["Accuracy", "FLOPs", "Memory", "Communication", "Sparsity"]
-    fig, axs = plt.subplots(2, 3, figsize=(12, 8))
-    fig.suptitle("Federated Training Metrics by Partition Strategy", fontsize=16)
-    axs_flat = axs.ravel()
-
-    for i, key in enumerate(metric_keys):
-        ax = axs_flat[i]  
-        ax.set_title(metric_titles[i])
-        for strategy, data in all_results.items():
-            if key not in data:
-                continue 
-
-            y_values = data[key]
-            rounds_axis = range(1, len(y_values) + 1)
-
-            if key == "sparsity":
-                y_values = [val * 100 for val in y_values]
-            ax.plot(rounds_axis, y_values, label=strategy)
-
-        ax.set_xlabel("Round")
-        if key == "acc":
-            ax.set_ylabel("Accuracy")
-        elif key == "flops":
-            ax.set_ylabel("Approx FLOPs")
-        elif key == "mem":
-            ax.set_ylabel("Memory (bytes)")
-        elif key == "comm":
-            ax.set_ylabel("Comm (bytes)")
-        elif key == "sparsity":
-            ax.set_ylabel("Non-zero fraction (%)")
-
-        ax.legend()
-
-    axs_flat[-1].axis("off")
-
+    plt.xlabel("Round")
+    plt.ylabel(ylabel or metric.replace("_", " ").title())
+    plt.title(title or f"Comparison of {metric.replace('_', ' ').title()} Across Partitions")
+    plt.legend()
+    plt.grid(True)
     plt.tight_layout()
     plt.show()
 

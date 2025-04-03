@@ -4,6 +4,12 @@ from torch.utils.data import DataLoader
 from torch.optim import SGD, Adam
 import flwr as fl
 from models.config import get_tinyprop_config
+from utils.training_helpers import (
+    compute_avg_grad_norm,
+    compute_adaptive_ratio,
+    compute_sparsity_and_flops,
+    compute_sparse_deltas
+)
 
 class FederatedClient(fl.client.NumPyClient):
     def __init__(self, model, train_data, test_data=None, device="cpu", dataset_name="mnist"):
@@ -14,27 +20,37 @@ class FederatedClient(fl.client.NumPyClient):
         if test_data is not None:
             self.test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
 
-        # Load dataset-specific config
-        cfg = get_tinyprop_config(dataset_name)
-
-        opt_cfg = cfg["optimizer"]
-        if opt_cfg["type"] == "sgd":
-            self.optimizer = SGD(self.model.parameters(), lr=opt_cfg["lr"], momentum=opt_cfg["momentum"])
+        self.cfg = get_tinyprop_config(dataset_name)
+        optimizer_cfg = self.cfg["optimizer"]
+        if optimizer_cfg["type"] == "sgd":
+            self.optimizer = SGD(
+                self.model.parameters(), 
+                lr=optimizer_cfg["lr"], 
+                momentum=optimizer_cfg.get("momentum", 0.0)
+            )
         else:
-            self.optimizer = Adam(self.model.parameters(), lr=opt_cfg["lr"])
-
+            self.optimizer = Adam(self.model.parameters(), lr=optimizer_cfg["lr"])
 
         self.criterion = nn.CrossEntropyLoss()
+
+        self.skip_threshold = self.cfg["skip_threshold"]
+        self.full_flops_per_batch = self.cfg["full_flops_per_batch"]
+        self.phi_min = self.cfg.get("phi_min", 0.0)
 
         self.last_flops = 0.0
         self.last_mem = 0.0
         self.last_comm = 0.0
         self.last_sparsity = 0.0
+        self.last_avg_grad_norm = 0.0
+        self.last_phi = 0.0
+        self.num_skipped_batches = 0
+        self.total_batches = 0
+        self.compression_ratio = 0.0
+        self.layer_sparsity = {}
 
         self.initial_grad_norm = 1e-9
         self.did_init_grad = False
-        self.skip_threshold = cfg["skip_threshold"]
-        self.full_flops_per_batch = cfg["full_flops_per_batch"]
+        self.weight_deltas = {}
 
     def get_parameters(self):
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
@@ -46,77 +62,68 @@ class FederatedClient(fl.client.NumPyClient):
             new_state_dict[key] = torch.tensor(param)
         self.model.load_state_dict(new_state_dict)
 
-    def train(self, num_epochs=1):
+    def train(self, num_epochs=1, warmup_rounds=5, current_round=0):
         self.last_flops = 0.0
         self.last_mem = 0.0
         self.last_comm = 0.0
         self.last_sparsity = 0.0
+        self.last_avg_grad_norm = 0.0
+        self.last_phi = 0.0
+        self.num_skipped_batches = 0
+        self.total_batches = 0
+        self.weight_deltas = {}
 
-        total_nonzero_grads = 0
-        total_grads = 0
-        total_changed_params = 0
-        peak_nonzero = 0
+        initial_state = {
+            name: param.detach().clone().cpu()
+            for name, param in self.model.state_dict().items()
+        }
 
         self.model.train()
-        for _ in range(num_epochs):
-            for images, labels in self.train_loader:
-                images, labels = images.to(self.device), labels.to(self.device)
-                self.optimizer.zero_grad()
-                outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
-                loss.backward()
+        for images, labels in self.train_loader:
+            self.total_batches += 1
+            images, labels = images.to(self.device), labels.to(self.device)
+            self.optimizer.zero_grad()
+            outputs = self.model(images)
+            loss = self.criterion(outputs, labels)
+            loss.backward()
 
-                total_gnorm = 0.0
-                total_params = 0
-                for param in self.model.parameters():
-                    if param.grad is not None:
-                        g = param.grad.data
-                        total_gnorm += g.norm(2).item()
-                        total_params += 1
+            avg_gnorm = compute_avg_grad_norm(self.model)
+            self.last_avg_grad_norm = avg_gnorm
 
-                if total_params > 0:
-                    avg_gnorm = total_gnorm / total_params
-                else:
-                    avg_gnorm = 0.0
+            if not self.did_init_grad:
+                self.initial_grad_norm = max(1e-9, avg_gnorm)
+                self.did_init_grad = True
 
-                if not self.did_init_grad:
-                    self.initial_grad_norm = max(1e-9, avg_gnorm)
-                    self.did_init_grad = True
+            if current_round >= warmup_rounds and avg_gnorm < self.skip_threshold:
+                self.num_skipped_batches += 1
+                continue
 
-                if total_gnorm < self.skip_threshold:
-                    continue
-
-                phi = avg_gnorm / self.initial_grad_norm
-
+            if current_round >= warmup_rounds:
+                phi = compute_adaptive_ratio(avg_gnorm, self.initial_grad_norm, self.phi_min)
+                self.last_phi = phi
                 self.model.adaptive_ratio = phi
 
-                nonzero = 0
-                total_elems = 0
-                for param in self.model.parameters():
-                    if param.grad is not None:
-                        g = param.grad.data
-                        nz = (g.abs() > 1e-9).sum().item()
-                        nonzero += nz
-                        total_elems += g.numel()
+            self.optimizer.step()
 
-                total_nonzero_grads += nonzero
-                total_grads += total_elems
+            batch_sparsity, batch_flops = compute_sparsity_and_flops(self.model, self.full_flops_per_batch)
+            self.last_flops += batch_flops
 
-                changed_params = nonzero
-                total_changed_params += changed_params
+        self.weight_deltas, sparsity, peak_mem = compute_sparse_deltas(self.model, initial_state, self.device)
+        self.last_sparsity = sparsity
+        self.last_mem = peak_mem
 
-                self.optimizer.step()
+        # Compression ratio
+        total_weights = sum(p.numel() for p in self.model.parameters())
+        nonzero_weights = sum(len(i) for _, i in self.weight_deltas.values())
+        self.compression_ratio = nonzero_weights / total_weights if total_weights > 0 else 0.0
 
-                fraction_sparsity = nonzero / (total_elems if total_elems > 0 else 1)
-                self.last_flops += self.full_flops_per_batch * fraction_sparsity
-
-                if nonzero > peak_nonzero:
-                    peak_nonzero = nonzero
-
-        if total_grads > 0:
-            self.last_sparsity = total_nonzero_grads / total_grads
-        self.last_mem = peak_nonzero * 4.0
-        self.last_comm = total_changed_params * 4.0
+        # Layer-wise sparsity (optional detail)
+        for name, param in self.model.named_parameters():
+            if name in initial_state:
+                delta = param.detach().cpu() - initial_state[name]
+                total = delta.numel()
+                nonzero = (delta.abs() > 1e-9).sum().item()
+                self.layer_sparsity[name] = 1.0 - (nonzero / total) if total > 0 else 1.0
 
     def local_evaluate(self, data_loader):
         self.model.eval()

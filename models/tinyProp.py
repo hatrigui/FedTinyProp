@@ -53,14 +53,17 @@ class TinyPropLayer:
         idx_list = []
         val_list = []
         for batch, k in enumerate(K):
-            grad = grad_output[batch]
-            k = min(k.item(), grad.numel())  # extra safe
+            grad = grad_output[batch].view(-1)  # ensure flat
+            if grad.numel() == 0:
+                continue
+            k = min(k.item(), grad.numel())
             if k == 0:
-                continue  # skip if zero
+                continue
             _, indices = grad.abs().topk(k)
             batch_idx = torch.full_like(indices, batch)
             idx_list.append(torch.vstack((batch_idx, indices)))
             val_list.append(torch.index_select(grad, -1, indices))
+
             
 
 
