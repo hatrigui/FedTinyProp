@@ -53,21 +53,31 @@ class TinyPropLayer:
         idx_list = []
         val_list = []
         for batch, k in enumerate(K):
-            grad = grad_output[batch].view(-1)  # ensure flat
+            grad = grad_output[batch].view(-1)  
             if grad.numel() == 0:
-                continue
-            k = min(k.item(), grad.numel())
+                continue  
+
+            k = min(k.item(), grad.numel())  
+
             if k == 0:
+                continue 
+
+            try:
+                _, indices = grad.abs().topk(k)
+            except RuntimeError as e:
+                print(f"[ERROR] topk failed: k={k}, grad.numel()={grad.numel()} — skipping this batch.")
                 continue
-            _, indices = grad.abs().topk(k)
+
             batch_idx = torch.full_like(indices, batch)
             idx_list.append(torch.vstack((batch_idx, indices)))
             val_list.append(torch.index_select(grad, -1, indices))
 
-            
+        if not idx_list:
+            print("[WARN] No gradients selected — returning empty tensors.")
+            empty_indices = torch.empty((2, 0), dtype=torch.long, device=grad_output.device)
+            empty_values = torch.empty((0,), dtype=grad_output.dtype, device=grad_output.device)
+            return empty_indices, empty_values
 
-
-            
         indices_sparse = torch.hstack(idx_list)
         values_sparse = torch.cat(val_list)
         return indices_sparse, values_sparse
