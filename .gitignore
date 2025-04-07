@@ -7,3 +7,4 @@ __pycache__/
 
 # Dataset & outputs (optional - depending on size)
 notebooks/data/
+data/

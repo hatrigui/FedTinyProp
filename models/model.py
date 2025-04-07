@@ -23,75 +23,64 @@ class TinyPropCNN(nn.Module):
         return x
 
 # For CIFAR10/CIFAR100
-class TinyPropBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, tinyPropParams, layer_number, downsample=False):
-        super(TinyPropBlock, self).__init__()
-        stride = 2 if downsample else 1
-        self.conv1 = TinyPropConv2d(in_channels, out_channels, kernel_size=3, padding=1,
-                                    stride=stride, tinyPropParams=tinyPropParams, layer_number=layer_number)
+class BasicBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride, tp_params, layer_number):
+        super(BasicBlock, self).__init__()
+        self.conv1 = TinyPropConv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1,
+                                     tinyPropParams=tp_params, layer_number=layer_number)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = TinyPropConv2d(out_channels, out_channels, kernel_size=3, padding=1,
-                                    tinyPropParams=tinyPropParams, layer_number=layer_number)
+        self.conv2 = TinyPropConv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                                     tinyPropParams=tp_params, layer_number=layer_number)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
-        self.skip = nn.Sequential()
-        if downsample or in_channels != out_channels:
-            self.skip = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                TinyPropConv2d(in_channels, out_channels, kernel_size=1, stride=stride, padding=0,
+                               tinyPropParams=tp_params, layer_number=layer_number),
                 nn.BatchNorm2d(out_channels)
             )
 
     def forward(self, x):
-        identity = self.skip(x)
-        out = self.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out += identity
-        return self.relu(out)
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
 
+class TinyPropResNet8(nn.Module):
+    def __init__(self, tinyprop_params: TinyPropParams, num_classes=10):
+        super(TinyPropResNet8, self).__init__()
+        self.in_channels = 16
 
-class TinyPropResNet8_CIFAR10(nn.Module):
-    def __init__(self, tinyprop_params: TinyPropParams):
-        super().__init__()
-        self.conv = TinyPropConv2d(3, 16, kernel_size=3, padding=1, tinyPropParams=tinyprop_params, layer_number=1)
-        self.bn = nn.BatchNorm2d(16)
-        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = TinyPropConv2d(3, 16, kernel_size=3, stride=1, padding=1,
+                                    tinyPropParams=tinyprop_params, layer_number=1)
+        self.bn1 = nn.BatchNorm2d(16)
 
-        self.layer1 = TinyPropBlock(16, 32, tinyprop_params, layer_number=2, downsample=True)
-        self.layer2 = TinyPropBlock(32, 64, tinyprop_params, layer_number=2, downsample=True)
+        self.layer1 = self._make_layer(16, num_blocks=1, stride=1, tp_params=tinyprop_params, layer_number=1)
+        self.layer2 = self._make_layer(32, num_blocks=1, stride=2, tp_params=tinyprop_params, layer_number=2)
+        self.layer3 = self._make_layer(64, num_blocks=1, stride=2, tp_params=tinyprop_params, layer_number=3)
 
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = TinyPropLinear(64, 10, tinyprop_params, layer_number=3)
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = TinyPropLinear(64, num_classes, tinyPropParams=tinyprop_params, layer_number=3)
 
-    def forward(self, x):
-        x = self.relu(self.bn(self.conv(x)))
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
-
-
-class TinyPropResNet8_CIFAR100(nn.Module):
-    def __init__(self, tinyprop_params: TinyPropParams):
-        super().__init__()
-        self.conv = TinyPropConv2d(3, 16, kernel_size=3, padding=1, tinyPropParams=tinyprop_params, layer_number=1)
-        self.bn = nn.BatchNorm2d(16)
-        self.relu = nn.ReLU(inplace=True)
-
-        self.layer1 = TinyPropBlock(16, 32, tinyprop_params, layer_number=2, downsample=True)
-        self.layer2 = TinyPropBlock(32, 64, tinyprop_params, layer_number=2, downsample=True)
-
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = TinyPropLinear(64, 100, tinyprop_params, layer_number=3)
+    def _make_layer(self, out_channels, num_blocks, stride, tp_params, layer_number):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for s in strides:
+            layers.append(BasicBlock(self.in_channels, out_channels, s, tp_params, layer_number))
+            self.in_channels = out_channels
+        return nn.Sequential(*layers)
 
     def forward(self, x):
-        x = self.relu(self.bn(self.conv(x)))
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.avg_pool(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
 
 
 
@@ -106,9 +95,10 @@ def get_tinyprop_model(dataset_name, tinyprop_params=None):
 
     if dataset_name in ['mnist', 'fashionmnist']:
         return TinyPropCNN(tinyprop_params)
-    elif dataset_name == 'cifar10':
-        return TinyPropResNet8_CIFAR10(tinyprop_params)
-    elif dataset_name == 'cifar100':
-        return TinyPropResNet8_CIFAR100(tinyprop_params)
+    elif dataset_name == "cifar10":
+        return TinyPropResNet8(tinyprop_params, num_classes=10)
+    elif dataset_name == "cifar100":
+        return TinyPropResNet8(tinyprop_params, num_classes=100)
+
     else:
         raise ValueError(f"Dataset {dataset_name} not supported.")

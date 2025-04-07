@@ -21,63 +21,64 @@ class TinyPropLayer:
         self.miniBatchK = 0.0
         self.epochBpr = []
         self.epochK = []
+        self.adaptive_ratio = 1.0  # Initialize adaptive ratio
 
     def BPR(self, params: TinyPropParams, Y: torch.Tensor) -> torch.Tensor:
-        return (params.S_min + Y * (params.S_max - params.S_min) / self.Y_max) * (params.zeta ** self.layerPosition)
+        # Ensure minimum gradient retention
+        min_retention = max(params.S_min, 0.1)  # At least 10% of gradients
+        max_retention = min(params.S_max, 0.5)  # At most 50% of gradients
+        return (min_retention + Y * (max_retention - min_retention) / self.Y_max) * (params.zeta ** self.layerPosition)
 
     def selectGradients(self, grad_output: torch.Tensor, params: TinyPropParams):
         if grad_output.size(1) == 0:
-            print("Warning: grad_output has zero dimension. Skipping top-k selection.")
+            return torch.empty((2, 0), dtype=torch.int64, device=grad_output.device), torch.empty((0,), dtype=grad_output.dtype, device=grad_output.device)
         
-            empty_indices = torch.empty((2, 0), dtype=torch.int64, device=grad_output.device)
-            empty_values = torch.empty((0,), dtype=grad_output.dtype, device=grad_output.device)
-            return empty_indices, empty_values
+        ratio_from_client = getattr(self, 'adaptive_ratio', 1.0)
         
-        ratio_from_client = getattr(self, 'adaptive_ratio', 1.0) 
-        
+        # Compute gradient importance with better normalization
         Y = grad_output.abs().sum(dim=1)
         max_Y = torch.max(Y)
         if max_Y > self.Y_max:
             self.Y_max = max_Y.item()
-            
-        bpr = (params.S_min + Y*(params.S_max - params.S_min)/self.Y_max) * (params.zeta ** self.layerPosition)
-        bpr = bpr * ratio_from_client
-        bpr = torch.clamp(bpr, 0.0, 1.0)
         
+        # Ensure minimum gradient retention
+        bpr = self.BPR(params, Y)
+        bpr = bpr * ratio_from_client
+        bpr = torch.clamp(bpr, 0.1, 0.5)  # Force minimum 10% retention
+        
+        # Compute number of gradients to keep
         K = torch.round(grad_output.size(1) * bpr)
         K = K.clamp(min=1, max=grad_output.size(1))
+        
+        # Update statistics
         self.miniBatchBpr += torch.mean(bpr).item()
         self.miniBatchK += torch.mean(K.float()).item()
         K = K.to(torch.int64)
         
+        # Select gradients
         idx_list = []
         val_list = []
         for batch, k in enumerate(K):
-            grad = grad_output[batch].view(-1)  
+            grad = grad_output[batch].view(-1)
             if grad.numel() == 0:
-                continue  
-
-            k = min(k.item(), grad.numel())  
-
+                continue
+            
+            k = min(k.item(), grad.numel())
             if k == 0:
-                continue 
-
+                continue
+            
             try:
                 _, indices = grad.abs().topk(k)
-            except RuntimeError as e:
-                print(f"[ERROR] topk failed: k={k}, grad.numel()={grad.numel()} — skipping this batch.")
+            except RuntimeError:
                 continue
-
+            
             batch_idx = torch.full_like(indices, batch)
             idx_list.append(torch.vstack((batch_idx, indices)))
             val_list.append(torch.index_select(grad, -1, indices))
-
+        
         if not idx_list:
-            print("[WARN] No gradients selected — returning empty tensors.")
-            empty_indices = torch.empty((2, 0), dtype=torch.long, device=grad_output.device)
-            empty_values = torch.empty((0,), dtype=grad_output.dtype, device=grad_output.device)
-            return empty_indices, empty_values
-
+            return torch.empty((2, 0), dtype=torch.long, device=grad_output.device), torch.empty((0,), dtype=grad_output.dtype, device=grad_output.device)
+        
         indices_sparse = torch.hstack(idx_list)
         values_sparse = torch.cat(val_list)
         return indices_sparse, values_sparse
@@ -175,11 +176,16 @@ class TinyPropConv2d(TinyPropLayer, nn.Conv2d):
                  bias: bool = True,
                  padding_mode: str = 'zeros'):
         TinyPropLayer.__init__(self, tinyPropParams.number_of_layers - layer_number)
-        nn.Conv2d.__init__(self, in_channels, out_channels, kernel_size,
-                           stride=stride, padding=padding, dilation=dilation, bias=bias, padding_mode=padding_mode)
+        
+        # Then initialize nn.Conv2d
+        nn.Conv2d.__init__(self, in_channels, out_channels, kernel_size, stride, padding, dilation, groups=1, bias=bias, padding_mode=padding_mode)
         self.tpParams = tinyPropParams
 
     def forward(self, input):
-        return SparseConv2d.apply(input, self.weight, self.bias, self.stride, self.padding,
-                                    self.dilation, self.groups, self.padding_mode, self._reversed_padding_repeated_twice,
-                                    self.tpParams, self)
+        
+        
+        return SparseConv2d.apply(
+            input, self.weight, self.bias, self.stride, self.padding,
+            self.dilation, self.groups, self.padding_mode,
+            self._reversed_padding_repeated_twice, self.tpParams, self
+        )
