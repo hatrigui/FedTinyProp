@@ -70,9 +70,12 @@ class AdaptiveSparsifier:
         global_sparsity: float
     ) -> Dict[str, float]:
         """Compute layer-wise sparsity based on layer sensitivity and importance."""
-        # Update layer sensitivity if not computed
+        # Initialize layer sensitivity if not computed
         if not self.layer_sensitivity:
-            self._compute_layer_sensitivity(model)
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    # Initialize with uniform sensitivity
+                    self.layer_sensitivity[name] = 1.0
         
         # Update layer importance
         self._update_layer_importance(model)

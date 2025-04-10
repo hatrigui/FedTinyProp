@@ -13,8 +13,9 @@ def compute_avg_grad_norm(model):
     return (total_norm / num_params) ** 0.5 if num_params > 0 else 0.0
 
 def compute_adaptive_ratio(grad_norm, initial_grad_norm, phi_min=0.0):
-    """Compute adaptive ratio based on gradient norms."""
-    if initial_grad_norm == 0:
+    """Compute the adaptive ratio between current and initial gradient norms."""
+    epsilon = 1e-8  # set a small constant to avoid division by zero
+    if abs(initial_grad_norm) < epsilon:
         return 1.0
     ratio = grad_norm / initial_grad_norm
     return max(phi_min, min(1.0, ratio))

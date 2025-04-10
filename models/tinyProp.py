@@ -11,6 +11,7 @@ class TinyPropParams:
         self.S_max = S_max
         self.zeta = zeta
         self.number_of_layers = number_of_layers
+        self.target_sparsity = S_max  # Use S_max as the target sparsity
 
 class TinyPropLayer:
  

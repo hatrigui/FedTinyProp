@@ -1,20 +1,25 @@
 import numpy as np
 from torch.utils.data import Subset, random_split
 
-def dirichlet_partition(dataset, num_clients, alpha=0.5):
-   
+def dirichlet_partition(dataset, num_clients, alpha):
+    from torch.utils.data import Subset
     labels = np.array(dataset.targets)
-    num_classes = np.max(labels) + 1
-    idx_by_class = {i: np.where(labels == i)[0] for i in range(num_classes)}
-    client_indices = {i: [] for i in range(num_clients)}
-    
-    for c in range(num_classes):
-        indices = idx_by_class[c]
-        np.random.shuffle(indices)
-        proportions = np.random.dirichlet(np.repeat(alpha, num_clients))
-        split_points = (np.cumsum(proportions) * len(indices)).astype(int)[:-1]
-        splits = np.split(indices, split_points)
-        for i in range(num_clients):
-            client_indices[i].extend(splits[i].tolist())
-    
-    return [client_indices[i] for i in range(num_clients)]
+    idx_batch = [[] for _ in range(num_clients)]
+    min_size = 0
+    K = len(np.unique(labels))
+
+    while min_size < 10:
+        idx_batch = [[] for _ in range(num_clients)]
+        for k in range(K):
+            idx_k = np.where(labels == k)[0]
+            np.random.shuffle(idx_k)
+            proportions = np.random.dirichlet(np.repeat(alpha, num_clients))
+            proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
+            idx_split = np.split(idx_k, proportions)
+            for i in range(num_clients):
+                idx_batch[i] += idx_split[i].tolist()
+        min_size = min(len(idx) for idx in idx_batch)
+
+    subsets = [Subset(dataset, idx) for idx in idx_batch]
+    return subsets
+

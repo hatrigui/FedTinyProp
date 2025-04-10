@@ -6,7 +6,7 @@ def get_tinyprop_config(dataset_name):
     if dataset_name in ["mnist", "fashionmnist"]:
         return {
             "tinyprop_params": TinyPropParams(S_min=0.05, S_max=0.5, zeta=0.25, number_of_layers=2),
-            "skip_threshold": 0.005,
+            "skip_threshold": 2.5,
             "full_flops_per_batch": 1e6,
             "optimizer": {
                 "type": "sgd",
