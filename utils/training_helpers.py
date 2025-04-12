@@ -43,4 +43,21 @@ def compute_sparse_deltas(model, initial_state, device):
             if len(nonzero_indices) > 0:
                 weight_deltas[name] = (nonzero_indices, delta[nonzero_indices])
             peak_mem = max(peak_mem, torch.cuda.max_memory_allocated(device))
-    return weight_deltas, peak_mem 
+    return weight_deltas, peak_mem
+
+def update_learning_rate(optimizer, scheduler, epoch):
+    """Update learning rate using scheduler if available."""
+    if scheduler is not None:
+        scheduler.step()
+    return optimizer.param_groups[0]['lr']
+
+def compute_layer_sparsity(model):
+    """Compute sparsity for each layer."""
+    layer_sparsity = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            total_params = param.numel()
+            nonzero_params = (param != 0).sum().item()
+            sparsity = 1.0 - (nonzero_params / total_params) if total_params > 0 else 0.0
+            layer_sparsity[name] = sparsity
+    return layer_sparsity 

@@ -18,28 +18,41 @@ class FederatedClient(fl.client.NumPyClient):
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.cfg = get_tinyprop_config(dataset_name)
-        # Ensure the FLOPs per batch is defined (adjust the default if needed)
-        self.cfg.setdefault("full_flops_per_batch", 1e6)
         
+        # Initialize optimizer with config parameters
         self.optimizer = SGD(
             self.model.parameters(),
             lr=self.cfg["optimizer"]["lr"],
             momentum=self.cfg["optimizer"].get("momentum", 0.9),
-            weight_decay=self.cfg["optimizer"].get("weight_decay", 0.0)
+            weight_decay=self.cfg["optimizer"].get("weight_decay", 0.0),
+            nesterov=self.cfg["optimizer"].get("nesterov", False)
         )
-        self.criterion = nn.CrossEntropyLoss()
         
-        # Adaptive sparsity configuration
-        self.S_min = self.cfg.get("S_min", 0.05)  # Minimum sparsity
-        self.S_max = self.cfg.get("S_max", 0.5)   # Maximum sparsity
-        self.zeta = self.cfg.get("zeta", 0.25)    # Scaling factor for phi
-        self.phi_skip_threshold = self.cfg.get("phi_skip_threshold", 0.2)  # New threshold for skipping updates
-        self.grad_norm_threshold = self.cfg.get("grad_norm_threshold", 1e-3)
-        self.skip_threshold = self.cfg.get("skip_threshold", 2.5)  # Set appropriate skip threshold
+        # Initialize learning rate scheduler if configured
+        if "lr_scheduler" in self.cfg:
+            scheduler_cfg = self.cfg["lr_scheduler"]
+            self.scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=scheduler_cfg["T_max"],
+                eta_min=scheduler_cfg["eta_min"]
+            )
+        else:
+            self.scheduler = None
         
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=self.cfg.get("label_smoothing", 0.0))
+        
+        # Get TinyProp parameters from config
+        tinyprop_params = self.cfg["tinyprop_params"]
+        self.S_min = tinyprop_params.S_min
+        self.S_max = tinyprop_params.S_max
+        self.zeta = tinyprop_params.zeta
+        self.skip_threshold = self.cfg.get("skip_threshold", 2.5)
+        self.phi_min = self.cfg.get("phi_min", 0.2)
+        
+        # Initialize adaptive sparsifier
         self.sparsifier = AdaptiveSparsifier(
-            initial_sparsity=self.cfg.get("initial_sparsity", 0.3),
-            target_sparsity=self.cfg.get("target_sparsity", 0.9),
+            initial_sparsity=self.S_min,
+            target_sparsity=self.S_max,
             total_rounds=self.cfg.get("total_rounds", 100),
             energy_budget=self.cfg.get("energy_budget", None)
         )
@@ -61,11 +74,10 @@ class FederatedClient(fl.client.NumPyClient):
         self.initial_grad_norms = []
         self.INITIAL_GRAD_NORM_BATCHES = 5
         self.adaptive_sparsity = True
-        self.phi_min = self.cfg.get("phi_min", 0.1)
         
         # Add EMA smoothing parameters
-        self.phi_ema_alpha = 0.9  # EMA coefficient for phi smoothing
-        self.target_sparsity_adjustment_rate = 0.1  # Rate to adjust towards target sparsity
+        self.phi_ema_alpha = 0.9
+        self.target_sparsity_adjustment_rate = 0.1
         
         # Enhanced metrics tracking
         self.metrics = {
