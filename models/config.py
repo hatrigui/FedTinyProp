@@ -5,19 +5,23 @@ def get_tinyprop_config(dataset_name):
 
     if dataset_name in ["mnist", "fashionmnist"]:
         return {
-            "tinyprop_params": TinyPropParams(S_min=0.05, S_max=0.5, zeta=0.25, number_of_layers=2),
+            "tinyprop_params": TinyPropParams(S_min=0.05, S_max=0.5, zeta=0.25, number_of_layers=2, random_skip=False),
             "skip_threshold": 2.5,
             "full_flops_per_batch": 1e6,
             "optimizer": {
                 "type": "sgd",
                 "lr": 0.001,
                 "momentum": 0.9
+            },
+            "quantization": {
+                "bits": 8,
+                "enabled": True
             }
         }
 
     elif dataset_name in ["cifar10", "cifar100"]:
         return {
-            "tinyprop_params": TinyPropParams(S_min=0.05, S_max=0.5, zeta=0.25, number_of_layers=8),  # 8 layers for ResNet18
+            "tinyprop_params": TinyPropParams(S_min=0.05, S_max=0.5, zeta=0.25, number_of_layers=8, random_skip=False),  # 8 layers for ResNet18
             "skip_threshold": 2.5,
             "full_flops_per_batch": 1e6,
             "phi_min": 0.2,
@@ -47,9 +51,36 @@ def get_tinyprop_config(dataset_name):
                     "contrast": 0.2,
                     "saturation": 0.2
                 }
+            },
+            "quantization": {
+                "bits": 8,
+                "enabled": True
             }
         }
 
+    elif dataset_name == "har":
+        return {
+            "tinyprop_params": TinyPropParams(S_min=0.05, S_max=0.5, zeta=0.25, number_of_layers=5, random_skip=False),
+            "skip_threshold": 2.5,
+            "full_flops_per_batch": 1e6,
+            "optimizer": {
+                "type": "sgd",
+                "lr": 0.005,
+                "momentum": 0.9
+            },
+            "lr_scheduler": {
+                "type": "cosine",
+                "T_max": 50,
+                "eta_min": 1e-5
+            },
+            "gradient_clip": 1.0,
+            "batch_size": 32,
+            "num_epochs": 1,
+            "quantization": {
+                "bits": 8,
+                "enabled": True
+            }
+        }
 
     else:
         raise ValueError(f"No config defined for dataset: {dataset_name}")

@@ -163,4 +163,25 @@ class AdaptiveSparsifier:
             'layer_sensitivity': self.layer_sensitivity,
             'layer_importance': self.layer_importance,
             'energy_efficiency': sum(self.energy_history) / len(self.energy_history) if self.energy_history else None
-        } 
+        }
+    
+    def adjust_sparsity(self, new_initial_sparsity=None, new_target_sparsity=None, new_rounds=None, new_energy_budget=None):
+        """Dynamically adjust sparsity parameters during training.
+        
+        Args:
+            new_initial_sparsity: New initial sparsity value
+            new_target_sparsity: New target sparsity value
+            new_rounds: New number of rounds
+            new_energy_budget: New energy budget
+        """
+        if new_initial_sparsity is not None:
+            self.initial_sparsity = new_initial_sparsity
+        if new_target_sparsity is not None:
+            self.target_sparsity = new_target_sparsity
+        if new_rounds is not None:
+            self.total_rounds = new_rounds
+        if new_energy_budget is not None:
+            self.energy_budget = new_energy_budget
+            
+        # Recompute schedule with new parameters
+        self._compute_schedule() 

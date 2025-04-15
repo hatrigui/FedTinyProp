@@ -1,0 +1,2 @@
+round,accuracy,flops,memory_bytes,communication_bytes,sparsity,avg_grad_norm,avg_phi,skipped_batches,effective_compute_ratio,compression_ratio
+1,0.2840176450627757,203602565.07065052,442.3671875,3626931.1999999993,0.12130061458196266,1.9338233290399807,0.5182334377529392,0,1.0,0.9439862743301657
