@@ -57,7 +57,6 @@ def federated_training(
     save_interval=1,
     quantization_bits=8
 ):
-    # Set random seeds for reproducibility
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -70,7 +69,6 @@ def federated_training(
     if "dataset_sizes" not in aggregator_kwargs:
         aggregator_kwargs["dataset_sizes"] = [len(ds) for ds in client_datasets]
 
-    # Initialize metrics logging dictionary
     metrics_log = {
         "accuracy": [], "flops": [], "memory": [], "communication": [], "sparsity": [],
         "avg_grad_norm": [], "phi_k": [], "skipped_batches": [],
@@ -86,7 +84,6 @@ def federated_training(
         print(f"\n[Training Debug] Starting federated training with {num_clients} clients")
         print(f"[Training Debug] Partition type: {partition_type}, alpha: {alpha}")
         
-        # Initialize global model and clients
         global_model = get_tinyprop_model(model_name, tinyprop_params)
         global_params = global_model.state_dict()
         clients = []
@@ -94,12 +91,10 @@ def federated_training(
         
         print("\n[Training Debug] Initializing clients...")
         for i in range(num_clients):
-            # Create proper DataLoaders
             train_loader = DataLoader(client_datasets[i], batch_size=32, shuffle=True)
             test_loader = DataLoader(testset, batch_size=32, shuffle=False)
             dataset_sizes.append(len(train_loader.dataset))
             
-            # Initialize client with proper loaders
             client = FederatedClient(
                 model=get_tinyprop_model(model_name, tinyprop_params),
                 train_loader=train_loader,
@@ -110,14 +105,12 @@ def federated_training(
             clients.append(client)
             print(f"[Training Debug] Client {i} initialized with {dataset_sizes[i]} samples")
         
-        # Training loop
         client_deltas = []
         quantization_errors = []
         avg_scale_factors = []
         for round_num in range(num_rounds):
             print(f"\n[Training Debug] Starting round {round_num + 1}/{num_rounds}")
             
-            # Train each client
             for client_idx, client in enumerate(clients):
                 print(f"\n[Training Debug] Training client {client_idx}")
                 try:
@@ -126,7 +119,6 @@ def federated_training(
                         config={"local_epochs": local_epochs}
                     )
                     
-                    # Debug weight deltas
                     print(f"\n[Training Debug] Client {client_idx} weight_deltas:")
                     print(f"Keys: {list(client.weight_deltas.keys())}")
                     for param_name, update in client.weight_deltas.items():
@@ -148,7 +140,6 @@ def federated_training(
                     print(f"[Training Debug][Client {client_idx}] Error during training: {str(e)}")
                     continue
             
-            # Aggregate updates
             print("\n[Server Debug] Starting aggregation of client updates...")
             total_updates = 0
             total_skipped = 0
@@ -160,13 +151,11 @@ def federated_training(
                 for param_name, (indices, values) in deltas.items():
                     if isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
                         total_updates += 1
-                        # Apply the update to the global model
                         param = global_model.state_dict()[param_name]
                         if param.device != values.device:
                             values = values.to(param.device)
                             indices = indices.to(param.device)
                         
-                        # Apply the sparse update
                         param.view(-1)[indices] += values * client_weight
                     else:
                         total_skipped += 1
@@ -177,22 +166,18 @@ def federated_training(
             print(f"Parameters skipped: {total_skipped}")
             print(f"Parameters updated: {total_updates}/{total_updates + total_skipped}")
             
-            # Calculate total communication cost
             total_comm = 0
             for deltas in client_deltas:
                 for name, (indices, values) in deltas.items():
                     if isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
                         total_comm += indices.numel() + values.numel()
-            print(f"Total communication: {total_comm * 4 / 1024:.2f}KB")  # 4 bytes per element
+            print(f"Total communication: {total_comm * 4 / 1024:.2f}KB")  
             
-            # Update global model
             global_model.load_state_dict(global_params)
             
-            # Evaluate global model
             acc = sum(client.local_evaluate(client.test_loader) for client in clients) / len(clients)
             print(f"\n[Server Debug] Global model accuracy: {acc:.4f}")
             
-            # Log metrics
             metrics_log["accuracy"].append(acc)
             metrics_log["flops"].append(sum(client.last_flops for client in clients) / len(clients))
             metrics_log["memory"].append(max(client.last_mem for client in clients))
@@ -204,7 +189,6 @@ def federated_training(
             metrics_log["effective_compute_ratio"].append(1 - sum(client.num_skipped_batches for client in clients) / sum(len(client.train_loader) for client in clients))
             metrics_log["compression_ratio"].append(sum(client.compression_ratio for client in clients) / len(clients))
             
-            # Calculate quantization metrics
             round_quantization_errors = []
             round_scale_factors = []
             for client in clients:
@@ -218,7 +202,6 @@ def federated_training(
             quantization_errors.append(avg_quantization_error)
             avg_scale_factors.append(avg_scale_factor)
             
-            # Clear client deltas for next round
             client_deltas = []
         
         # Save metrics

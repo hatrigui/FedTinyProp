@@ -25,7 +25,6 @@ class FederatedClient(fl.client.NumPyClient):
         self.model.to(self.device)
         self.dataset_name = dataset_name
         
-        # Initialize metrics tracking with default values
         self.metrics = {
             'round': [],
             'loss': [],
@@ -39,11 +38,9 @@ class FederatedClient(fl.client.NumPyClient):
             'compression_ratio': []
         }
         
-        # Store initial weights for delta computation
         self.initial_weights = None
         self.global_weights = None
         
-        # Initialize metrics with default values
         self.last_flops = 0.0
         self.last_mem = 0.0
         self.last_comm = 0.0
@@ -55,7 +52,6 @@ class FederatedClient(fl.client.NumPyClient):
         self.compression_ratio = 1.0
         self.layer_sparsity = {}
         
-        # Initialize optimizer with config parameters
         self.optimizer = SGD(
             self.model.parameters(),
             lr=self.cfg["optimizer"]["lr"],
@@ -64,7 +60,6 @@ class FederatedClient(fl.client.NumPyClient):
             nesterov=self.cfg["optimizer"].get("nesterov", False)
         )
         
-        # Initialize learning rate scheduler if configured
         if "lr_scheduler" in self.cfg:
             scheduler_cfg = self.cfg["lr_scheduler"]
             self.scheduler = CosineAnnealingLR(
@@ -77,7 +72,6 @@ class FederatedClient(fl.client.NumPyClient):
         
         self.criterion = nn.CrossEntropyLoss(label_smoothing=self.cfg.get("label_smoothing", 0.0))
         
-        # Get TinyProp parameters from config
         tinyprop_params = self.cfg["tinyprop_params"]
         self.S_min = tinyprop_params.S_min
         self.S_max = tinyprop_params.S_max
@@ -85,7 +79,6 @@ class FederatedClient(fl.client.NumPyClient):
         self.skip_threshold = self.cfg.get("skip_threshold", 2.5)
         self.phi_min = self.cfg.get("phi_min", 0.2)
         
-        # Initialize adaptive sparsifier
         self.sparsifier = AdaptiveSparsifier(
             initial_sparsity=self.S_min,
             target_sparsity=self.S_max,
@@ -93,7 +86,6 @@ class FederatedClient(fl.client.NumPyClient):
             energy_budget=self.cfg.get("energy_budget", None)
         )
         
-        # Initialize metrics tracking with safety checks
         self.weight_deltas = {}
         self.initial_grad_norm = None
         self.smoothed_phi = None
@@ -101,11 +93,9 @@ class FederatedClient(fl.client.NumPyClient):
         self.INITIAL_GRAD_NORM_BATCHES = 5
         self.adaptive_sparsity = True
         
-        # Add EMA smoothing parameters
         self.phi_ema_alpha = 0.9
         self.target_sparsity_adjustment_rate = 0.1
         
-        # Enhanced metrics tracking with default values
         self.metrics = {
             "nonzero_gradients": [],
             "batch_flops": [],
@@ -116,7 +106,6 @@ class FederatedClient(fl.client.NumPyClient):
             "skipped_updates": 0
         }
         
-        # Initialize TinyPropLayer statistics if not already initialized
         if not hasattr(self.model.tpLayer, 'stats'):
             self.model.tpLayer.stats = {
                 "skipped_batches": 0,
@@ -128,7 +117,6 @@ class FederatedClient(fl.client.NumPyClient):
                 "loss_threshold": 0.01
             }
         
-        # Initialize quantization parameters from config
         quantization_cfg = cfg.get("quantization", {"bits": 32, "enabled": False})
         self.quantization_bits = quantization_cfg.get("bits", 32)
         self.quantization_enabled = quantization_cfg.get("enabled", False)
@@ -169,10 +157,7 @@ class FederatedClient(fl.client.NumPyClient):
         batch_size = config.get("batch_size", 32) if config else 32
         local_epochs = config.get("local_epochs", 1) if config else 1
         
-        # Train the model
         loss, accuracy = self.train(num_epochs=local_epochs, batch_size=batch_size)
-        
-        # Get updated parameters and metrics
         updated_parameters = self.get_parameters()
         metrics = {
             "loss": float(loss),
@@ -189,8 +174,8 @@ class FederatedClient(fl.client.NumPyClient):
         self.set_parameters(parameters)
         if self.test_loader is not None:
             acc = self.local_evaluate(self.test_loader)
-            return float(acc), len(self.test_loader.dataset)  # Return only accuracy and num_examples
-        return 0.0, 0  # Return only accuracy and num_examples
+            return float(acc), len(self.test_loader.dataset)  
+        return 0.0, 0  
 
     def compute_grad_norm(self) -> float:
         """Compute the L2 norm of all gradients in the model."""
@@ -205,7 +190,6 @@ class FederatedClient(fl.client.NumPyClient):
         """Update the adaptive sparsity coefficient with EMA smoothing."""
         epsilon = 1e-8
         if self.initial_grad_norm is None:
-            # If the very first gradient norm is near zero, set it to epsilon
             if abs(current_grad_norm) < epsilon:
                 self.initial_grad_norm = epsilon
             else:
@@ -213,10 +197,8 @@ class FederatedClient(fl.client.NumPyClient):
             self.smoothed_phi = 1.0
             return 1.0
         
-        # Compute raw phi
         raw_phi = compute_adaptive_ratio(current_grad_norm, self.initial_grad_norm, self.phi_min)
         
-        # Apply EMA smoothing
         if self.smoothed_phi is None:
             self.smoothed_phi = raw_phi
         else:
@@ -236,22 +218,17 @@ class FederatedClient(fl.client.NumPyClient):
         
         for name, param in self.model.named_parameters():
             if param.grad is not None:
-                # Compute layer sparsity based on phi
                 layer_sparsity = max(self.S_min, min(self.S_max, self.zeta * phi))
                 
-                # Use random masking: for each element, drop it with probability equal to sparsity
                 mask = torch.rand_like(param) > layer_sparsity
                 param.grad.data *= mask.float()
                 
-                # Track metrics
                 nonzero_count = mask.sum().item()
                 total_nonzero += nonzero_count
                 total_elements += mask.numel()
                 
-                # Store layer sparsity for metrics
                 self.layer_sparsity[name] = 1.0 - (nonzero_count / mask.numel())
         
-        # Update metrics
         if total_elements > 0:
             effective_sparsity = 1.0 - (total_nonzero / total_elements)
             self.metrics["nonzero_gradients"].append(total_nonzero)
@@ -270,40 +247,33 @@ class FederatedClient(fl.client.NumPyClient):
             "communication_bytes": 0
         }
         
-        # Compute sparsity and FLOPs
         sparsity, flops = compute_sparsity_and_flops(self.model, self.cfg["full_flops_per_batch"])
         metrics["flops"] = flops
         metrics["sparsity"] = sparsity
         
-        # Add enhanced metrics if available
         if self.metrics["nonzero_gradients"]:
             metrics["avg_nonzero_gradients"] = np.mean(self.metrics["nonzero_gradients"])
         if self.metrics["effective_sparsity"]:
             metrics["avg_effective_sparsity"] = np.mean(self.metrics["effective_sparsity"])
         
-        # Track memory usage (GPU or CPU)
         if torch.cuda.is_available():
             metrics["peak_memory_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024)
         else:
             process = psutil.Process(os.getpid())
             metrics["peak_memory_mb"] = process.memory_info().rss / (1024 * 1024)
         
-        # Compute communication cost based on sparse weight deltas
         total_bytes = 0
         for name, (indices, values) in self.weight_deltas.items():
             if isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
-                # Each index is 4 bytes (int32) and each value is 4 bytes (float32)
                 total_bytes += (indices.numel() + values.numel()) * 4
         
         metrics["communication_bytes"] = total_bytes
         
-        # Update compression ratio
         if total_bytes > 0:
-            # Calculate original size (all parameters)
             original_size = sum(p.numel() * 4 for p in self.model.parameters() if p.requires_grad)
             self.compression_ratio = total_bytes / original_size
         else:
-            self.compression_ratio = 1.0  # No compression if no updates
+            self.compression_ratio = 1.0  
         
         return metrics
 
@@ -320,17 +290,11 @@ class FederatedClient(fl.client.NumPyClient):
         if not self.quantization_enabled or self.quantization_bits == 32:
             return tensor, 0.0, 1.0
             
-        # Calculate scale factor
         max_val = tensor.abs().max().item()
         scale_factor = (2 ** (self.quantization_bits - 1) - 1) / max_val if max_val > 0 else 1.0
-        
-        # Quantize
         quantized = torch.round(tensor * scale_factor) / scale_factor
         
-        # Calculate error
         error = torch.mean((tensor - quantized).abs()).item()
-        
-        # Store metrics
         self.quantization_metrics["errors"].append(error)
         self.quantization_metrics["scale_factors"].append(scale_factor)
         
@@ -343,56 +307,42 @@ class FederatedClient(fl.client.NumPyClient):
         total_loss = 0.0
         correct = 0
         total = 0
-        
-        # Reset skipped batches counter at the start of training
         self.num_skipped_batches = 0
         
-        # Store initial weights for computing deltas
         initial_weights = {name: param.data.clone() for name, param in self.model.named_parameters() if param.requires_grad}
-        
-        # Initialize metrics
         epoch_grad_norms = []
         total_flops = 0
         total_memory = 0
         total_communication = 0
         epoch_effective_sparsities = []
         
-        # Get current round from the model's state if available
         current_round = getattr(self.model, 'current_round', 0)
         total_rounds = self.cfg.get("total_rounds", 100)
         
-        # Set current round for TinyPropLayer
         self.model.tpLayer.current_round = current_round
         self.model.tpLayer.adjust_loss_threshold(current_round, total_rounds)
         
-        # Compute progressive sparsity factor based on current round
         progress = current_round / total_rounds
         progressive_factor = 1.0 + (self.S_max - self.S_min) * progress
-        
-        # Gradient clipping parameters
-        max_grad_norm = 1.0  # Maximum allowed gradient norm
+
+        max_grad_norm = 1.0  
         grad_clip_threshold = 5.0
         
         for epoch in range(num_epochs):
             for batch_idx, (inputs, targets) in enumerate(self.train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # Forward pass
                 self.optimizer.zero_grad()
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
                 
-                # Backward pass
                 loss.backward()
-                
-                # Apply quantization to gradients before update if enabled
                 if self.quantization_enabled:
                     for param in self.model.parameters():
                         if param.grad is not None:
                             quantized_grad, error, scale = self.apply_quantization(param.grad)
                             param.grad.data = quantized_grad
                 
-                # Compute gradient norm
                 grad_norm = 0.0
                 for p in self.model.parameters():
                     if p.grad is not None:
@@ -402,44 +352,33 @@ class FederatedClient(fl.client.NumPyClient):
                 if grad_norm > 0:
                     epoch_grad_norms.append(grad_norm)
                     
-                    # Update phi before checking if we should skip
                     self.model.tpLayer.update_phi(self.model.tpParams, loss.item(), batch_idx)
                     
-                    # Check if we should skip this batch
                     if self.model.tpLayer.should_skip_batch(loss.item(), self.model.tpParams):
                         self.num_skipped_batches += 1
                         continue
-                    
-                    # Update adaptive sparsity and compute phi
                     if self.adaptive_sparsity:
                         phi = self.update_adaptive_sparsity(grad_norm)
                         
-                        # Apply gradient sparsification with random masking
                         self.apply_gradient_sparsification(phi)
                         
-                        # Compute progressive sparsity that increases over time
                         base_sparsity = self.S_min + (self.S_max - self.S_min) * (1 - phi)
                         local_sparsity = min(self.S_max, base_sparsity * progressive_factor)
                         epoch_effective_sparsities.append(local_sparsity)
                         
-                        # Compute FLOPs for this batch
                         batch_flops = self.cfg["full_flops_per_batch"] * (1 - local_sparsity)
                         total_flops += batch_flops
                 
-                # Update weights
                 self.optimizer.step()
                 
-                # Update metrics
                 total_loss += loss.item()
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
                 
-                # Update memory usage
                 process = psutil.Process(os.getpid())
                 total_memory = max(total_memory, process.memory_info().rss / 1024 / 1024)
                 
-                # Print batch-level debug information
                 if batch_idx % 10 == 0:
                     print(f"\n[Batch {batch_idx}] Debug Info:")
                     print(f"  - Loss: {loss.item():.4f}")
@@ -448,11 +387,9 @@ class FederatedClient(fl.client.NumPyClient):
                     print(f"  - Skipped batches: {self.num_skipped_batches}")
                     print(f"  - Memory usage: {total_memory:.2f} MB")
             
-            # Update learning rate if scheduler is available
             if self.scheduler is not None:
                 self.scheduler.step()
         
-        # Compute final metrics
         self.last_flops = total_flops
         self.last_mem = total_memory
         self.last_comm = total_communication
@@ -460,33 +397,24 @@ class FederatedClient(fl.client.NumPyClient):
         self.last_avg_grad_norm = np.mean(epoch_grad_norms) if epoch_grad_norms else 0.0
         self.last_phi = self.model.phi_k
         
-        # Compute weight deltas
         self.weight_deltas = {}
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 initial = initial_weights[name]
                 final = param.data
                 delta = final - initial
-                
-                # Convert to sparse format
                 if delta.numel() > 0:
-                    # Find non-zero elements
-                    mask = delta.abs() > 1e-6  # Threshold for considering a value non-zero
-                    
-                    # Handle multi-dimensional tensors
+                    mask = delta.abs() > 1e-6  
                     if len(delta.shape) > 1:
-                        # For multi-dimensional tensors, we need to flatten and track indices
                         flat_delta = delta.view(-1)
                         flat_mask = mask.view(-1)
                         indices = flat_mask.nonzero().squeeze()
                         values = flat_delta[indices]
                     else:
-                        # For 1D tensors, we can use the mask directly
                         indices = mask.nonzero().squeeze()
                         values = delta[indices]
                     
-                    # Store the sparse representation
-                    if indices.numel() > 0:  # Only store if there are non-zero elements
+                    if indices.numel() > 0:  
                         self.weight_deltas[name] = (indices, values)
         
         return total_loss / len(self.train_loader), 100. * correct / total

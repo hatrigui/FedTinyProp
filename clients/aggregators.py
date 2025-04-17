@@ -6,7 +6,6 @@ def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_p
     global_state = global_model.state_dict()
     updated_state = {k: v.clone().float() for k, v in global_state.items()}
     
-    # Track aggregation statistics
     stats = {
         "total_updates": len(sparse_updates),
         "skipped_params": 0,
@@ -31,7 +30,6 @@ def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_p
             indices, values = update
             stats["total_params"] += 1
             
-            # Before applying update, check indices format and emptiness
             if isinstance(indices, tuple):
                 if all(idx.numel() == 0 for idx in indices):
                     print(f"[Server Debug] Empty update for parameter: {param_name}")
@@ -54,30 +52,18 @@ def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_p
                 print(f"[Server Debug] Invalid indices for parameter: {param_name}")
                 continue
             
-            # Get scale factor for this update
             scale_factor = getattr(update, 'scale_factor', 1.0)
-            
-            # Dequantize values before aggregation
             dequantized_values = values / scale_factor
-            
-            # Apply the sparse update with proper scaling
             flat_param.index_add_(0, indices, weight * dequantized_values)
             updated_state[param_name] = flat_param.view_as(param)
-            
-            # Update statistics
             stats["updated_params"] += 1
-            # Communication cost includes indices (int32) and quantized values (int8)
-            stats["communication_bytes"] += (indices.numel() * 4 + values.numel())  # 4 bytes for indices, 1 byte for quantized values
-            
-            # Track quantization error if available
+            stats["communication_bytes"] += (indices.numel() * 4 + values.numel())  
             if hasattr(update, 'quantization_error'):
                 stats["quantization_error"] += update.quantization_error
     
-    # Average quantization error across all updates
     if stats["updated_params"] > 0:
         stats["quantization_error"] /= stats["updated_params"]
     
-    # Log aggregation statistics
     print("\n[Server Debug] Aggregation Statistics:")
     print(f"Total clients processed: {stats['total_updates']}")
     print(f"Parameters skipped: {stats['skipped_params']}")
@@ -85,7 +71,6 @@ def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_p
     print(f"Total communication: {stats['communication_bytes']/1024:.1f}KB")
     print(f"Average quantization error: {stats['quantization_error']:.6f}")
     
-    # Update global model
     global_model.load_state_dict(updated_state)
     
     return global_model
