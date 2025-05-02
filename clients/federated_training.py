@@ -270,7 +270,8 @@ def federated_training(
             "avg_phi_k": 0.0,
             "avg_loss_change": 0.0,
             "loss_threshold": 0.0,
-            "skipped_ratio_sum": 0.0  # Track sum of per-client skipped ratios
+            "skipped_ratio_sum": 0.0,  # Track sum of per-client skipped ratios
+            "layer_flops": {}
         }
 
         # Set current round for all clients and adjust thresholds
@@ -292,6 +293,15 @@ def federated_training(
             # Update statistics
             stats["flops"] += client.last_flops
             stats["memory"] = max(stats["memory"], client.last_mem)
+            
+            # Track layer-wise FLOPs
+            if not hasattr(stats, "layer_flops"):
+                stats["layer_flops"] = {}
+            client_metrics = client.compute_metrics()
+            for layer_name, layer_flops in client_metrics["layer_flops"].items():
+                if layer_name not in stats["layer_flops"]:
+                    stats["layer_flops"][layer_name] = 0
+                stats["layer_flops"][layer_name] += layer_flops
             
             # Communication tracking
             comm_cost = 0.0
@@ -406,11 +416,18 @@ def federated_training(
 
         # Save metrics
         if save_dir and save_interval > 0 and rnd % save_interval == 0:
+            # Save layer-wise FLOPs to a separate file
+            layer_flops_path = os.path.join(save_dir, f"{partition_type}_{model_name}_layer_flops.csv")
+            with open(layer_flops_path, 'a') as f:
+                if rnd == 0:
+                    f.write("round," + ",".join(stats["layer_flops"].keys()) + "\n")
+                f.write(f"{rnd}," + ",".join(str(flops) for flops in stats["layer_flops"].values()) + "\n")
+            
             save_training_logs_csv(
                 os.path.join(save_dir, f"{partition_type}_{model_name}_training_logs.csv"),
                 metrics_log["accuracy"],
                 metrics_log["flops"],
-                metrics_log["memory"],
+                metrics_log["memory"],  
                 metrics_log["communication"],
                 metrics_log["sparsity"],
                 quantization_errors
@@ -422,7 +439,7 @@ def federated_training(
             rnd + 1,
             acc,
             metrics_log["flops"][-1],
-            metrics_log["memory"][-1],
+            metrics_log["memory"][-1],  
             metrics_log["communication"][-1],
             metrics_log["sparsity"][-1],
             metrics_log["avg_grad_norm"][-1],

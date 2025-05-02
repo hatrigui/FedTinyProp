@@ -57,7 +57,9 @@ def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_p
             flat_param.index_add_(0, indices, weight * dequantized_values)
             updated_state[param_name] = flat_param.view_as(param)
             stats["updated_params"] += 1
-            stats["communication_bytes"] += (indices.numel() * 4 + values.numel())  
+            indices_bytes = indices.numel() * indices.element_size()  # usually 8 bytes (int64)
+            values_bytes = values.numel() * values.element_size()    # usually 4 bytes (float32)
+            stats["communication_bytes"] += indices_bytes + values_bytes
             if hasattr(update, 'quantization_error'):
                 stats["quantization_error"] += update.quantization_error
     
