@@ -13,6 +13,7 @@ import psutil
 import pandas as pd
 from torch.utils.data import DataLoader
 from utils.flops_calculator import compute_model_flops
+from utils.memory_calculator import estimate_model_memory
 
 class FederatedClient(fl.client.NumPyClient):
     def __init__(self, client_id: int, model: nn.Module, train_loader: DataLoader, 
@@ -44,6 +45,7 @@ class FederatedClient(fl.client.NumPyClient):
         
         self.last_flops = 0.0
         self.last_mem = 0.0
+        self.last_mem_saved = 0.0
         self.last_comm = 0.0
         self.last_sparsity = 0.0
         self.last_avg_grad_norm = 0.0
@@ -213,7 +215,7 @@ class FederatedClient(fl.client.NumPyClient):
         return current_grad_norm < self.skip_threshold
 
     def apply_gradient_sparsification(self, phi: float) -> None:
-        """Apply gradient sparsification with random masking."""
+        """Apply gradient sparsification with top-k selection."""
         total_nonzero = 0
         total_elements = 0
         
@@ -221,14 +223,26 @@ class FederatedClient(fl.client.NumPyClient):
             if param.grad is not None:
                 layer_sparsity = max(self.S_min, min(self.S_max, self.zeta * phi))
                 
-                mask = torch.rand_like(param) > layer_sparsity
-                param.grad.data *= mask.float()
+                # Calculate number of elements to keep
+                num_elements = param.grad.numel()
+                num_keep = int(num_elements * (1 - layer_sparsity))
                 
-                nonzero_count = mask.sum().item()
+                # Get top-k values and indices
+                grad_flat = param.grad.data.view(-1)
+                values, indices = torch.topk(torch.abs(grad_flat), k=num_keep)
+                
+                # Create sparse gradient
+                sparse_grad = torch.zeros_like(grad_flat)
+                sparse_grad[indices] = grad_flat[indices]
+                
+                # Update gradient
+                param.grad.data = sparse_grad.view(param.grad.data.shape)
+                
+                nonzero_count = num_keep
                 total_nonzero += nonzero_count
-                total_elements += mask.numel()
+                total_elements += num_elements
                 
-                self.layer_sparsity[name] = 1.0 - (nonzero_count / mask.numel())
+                self.layer_sparsity[name] = 1.0 - (nonzero_count / num_elements)
         
         if total_elements > 0:
             effective_sparsity = 1.0 - (total_nonzero / total_elements)
@@ -236,42 +250,52 @@ class FederatedClient(fl.client.NumPyClient):
             self.metrics["effective_sparsity"].append(effective_sparsity)
 
     def compute_metrics(self) -> Dict[str, float]:
-        """Compute comprehensive training metrics."""
         metrics = {
-            "flops": self.last_flops,  # Use accumulated FLOPs from training
+            "flops": self.last_flops,
             "memory": 0.0,
+            "memory_saved": 0.0,
             "communication": 0.0,
             "sparsity": 0.0,
             "layer_flops": {}
         }
 
-        # Get input shape from first batch of train loader and use single sample shape
         sample_input, _ = next(iter(self.train_loader))
-        single_sample_shape = (1, *sample_input.shape[1:])  # Use shape for single sample
-
-        # Use explicitly computed layer sparsity
+        single_sample_shape = (1, *sample_input.shape[1:])
         _, layer_flops = compute_model_flops(
             self.model,
             single_sample_shape,
             layer_sparsity_dict=self.layer_sparsity
         )
-        # Scale layer-wise FLOPs by batch size to match total
         metrics["layer_flops"] = {k: v * sample_input.shape[0] for k, v in layer_flops.items()}
         metrics["sparsity"] = np.mean(list(self.layer_sparsity.values()))
 
-        # Memory usage calculation
-        metrics["peak_memory_mb"] = torch.cuda.max_memory_allocated() / (1024 * 1024) if torch.cuda.is_available() else psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+        input_shape = sample_input.shape[1:]
+        mem_report = estimate_model_memory(self.model, batch_size=sample_input.shape[0], input_shape=input_shape)
+        batch_memory = mem_report["total_MB"]
+        total_batches = len(self.train_loader)
+        processed_batches = total_batches - self.num_skipped_batches
+        skipped_batches = self.num_skipped_batches
 
-        # Communication bytes calculation
+        # Calculate memory used for processed batches
+        used_memory = processed_batches * batch_memory
+        # Calculate memory saved (difference between total and used)
+        saved_memory = skipped_batches * batch_memory
+
+        metrics["memory"] = used_memory
+        metrics["memory_saved"] = saved_memory
+        self.last_mem = metrics["memory"]
+        self.last_mem_saved = metrics["memory_saved"]
+
         total_bytes = sum(
             indices.numel() * indices.element_size() + values.numel() * values.element_size()
             for indices, values in self.weight_deltas.values()
         )
-        metrics["communication_bytes"] = total_bytes
+        metrics["communication"] = total_bytes
         original_size = sum(p.numel() * 4 for p in self.model.parameters() if p.requires_grad)
         metrics["compression_ratio"] = total_bytes / original_size if original_size else 1.0
 
         return metrics
+
 
     def get_quantization_metrics(self) -> Tuple[float, float]:
         """Return the current quantization error and average scale factor."""
@@ -319,10 +343,20 @@ class FederatedClient(fl.client.NumPyClient):
         self.model.tpLayer.adjust_loss_threshold(current_round, total_rounds)
         
         progress = current_round / total_rounds
-        progressive_factor = 1.0 + (self.S_max - self.S_min) * progress
+        # Make sparsity increase more aggressively by using a quadratic progression
+        progressive_factor = 1.0 + (self.S_max - self.S_min) * (progress ** 2)
+        
+        # Add early sparsity boost
+        if current_round < total_rounds * 0.3:  # First 30% of rounds
+            progressive_factor *= 1.5  # 50% boost in early rounds
 
         max_grad_norm = 1.0  
         grad_clip_threshold = 5.0
+        
+        # Track loss history for zeta adjustment
+        loss_history = []
+        loss_window_size = 5
+        zeta_adjustment_threshold = 0.01  # Minimum loss change to trigger zeta adjustment
         
         for epoch in range(num_epochs):
             for batch_idx, (inputs, targets) in enumerate(self.train_loader):
@@ -331,6 +365,23 @@ class FederatedClient(fl.client.NumPyClient):
                 self.optimizer.zero_grad()
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
+                
+                # Track loss history
+                loss_history.append(loss.item())
+                if len(loss_history) > loss_window_size:
+                    loss_history.pop(0)
+                
+                # Adjust zeta based on loss plateauing
+                if len(loss_history) == loss_window_size:
+                    loss_change = abs(loss_history[-1] - loss_history[0])
+                    if loss_change < zeta_adjustment_threshold:
+                        # Loss is plateauing, increase zeta to maintain sparsity
+                        self.zeta *= 1.05  # 5% increase
+                    elif loss_change > zeta_adjustment_threshold * 2:
+                        # Loss is changing significantly, decrease zeta to allow more updates
+                        self.zeta *= 0.95  # 5% decrease
+                    # Keep zeta within reasonable bounds
+                    self.zeta = max(0.1, min(2.0, self.zeta))
                 
                 loss.backward()
                 if self.quantization_enabled:
@@ -344,6 +395,13 @@ class FederatedClient(fl.client.NumPyClient):
                     if p.grad is not None:
                         grad_norm += p.grad.data.norm(2).item() ** 2
                 grad_norm = grad_norm ** 0.5
+                
+                # Apply gradient clipping
+                if grad_norm > grad_clip_threshold:
+                    scale = grad_clip_threshold / (grad_norm + 1e-6)
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            p.grad.data *= scale
                 
                 if grad_norm > 0:
                     epoch_grad_norms.append(grad_norm)
@@ -372,7 +430,6 @@ class FederatedClient(fl.client.NumPyClient):
                             print(f"[Debug] Per-sample FLOPs: {per_sample_flops:.2f}")
                             print(f"[Debug] Batch size: {inputs.shape[0]}")
                             print(f"[Debug] Total batch FLOPs: {batch_flops:.2f}")
-
                 
                 self.optimizer.step()
                 
@@ -389,6 +446,7 @@ class FederatedClient(fl.client.NumPyClient):
                     print(f"  - Loss: {loss.item():.4f}")
                     print(f"  - Grad Norm: {grad_norm:.4f}")
                     print(f"  - Current phi_k: {self.model.phi_k:.4f}")
+                    print(f"  - Current zeta: {self.zeta:.4f}")
                     print(f"  - Skipped batches: {self.num_skipped_batches}")
                     print(f"  - Memory usage: {total_memory:.2f} MB")
             

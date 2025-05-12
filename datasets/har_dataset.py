@@ -34,9 +34,8 @@ class HARDataset(Dataset):
         data = np.loadtxt(data_path)
         labels = np.loadtxt(label_path) - 1  # Convert to 0-based indexing
         
-        # Pad to 576 features (24x24), reshape for CNN
-        data = np.pad(data, ((0,0), (0,15)), 'constant')
-        data = data.reshape(-1, 1, 24, 24)
+        # Reshape for 1D CNN: [batch_size, channels, sequence_length]
+        data = data.reshape(-1, 1, data.shape[1])
 
         return torch.FloatTensor(data), torch.LongTensor(labels)
     
@@ -44,7 +43,9 @@ class HARDataset(Dataset):
         """Normalize data to mean 0 and std 1 (per dataset)."""
         mean = self.data.mean()
         std = self.data.std()
-        self.data = (self.data - mean) / std
+        # Add small epsilon to prevent division by zero
+        eps = 1e-8
+        self.data = (self.data - mean) / (std + eps)
 
     def __len__(self):
         return len(self.labels)

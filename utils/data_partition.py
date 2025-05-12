@@ -11,14 +11,24 @@ def dirichlet_partition(dataset, num_clients, alpha, min_size_per_client=10, max
         for k in range(K):
             idx_k = np.where(labels == k)[0]
             np.random.shuffle(idx_k)
-            proportions = np.random.dirichlet(np.repeat(alpha, num_clients))
             
-            # Normalize and convert to indexes
-            proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
-            idx_split = np.split(idx_k, proportions)
+            # Ensure each client gets at least one sample from each class
+            if len(idx_k) < num_clients:
+                raise ValueError(f"Not enough samples of class {k} ({len(idx_k)}) for {num_clients} clients")
             
+            # First assign one sample to each client
             for i in range(num_clients):
-                idx_batch[i] += idx_split[i].tolist()
+                idx_batch[i].append(idx_k[i])
+            
+            # Then distribute remaining samples using Dirichlet distribution
+            remaining_idx = idx_k[num_clients:]
+            if len(remaining_idx) > 0:
+                proportions = np.random.dirichlet(np.repeat(alpha, num_clients))
+                proportions = (np.cumsum(proportions) * len(remaining_idx)).astype(int)[:-1]
+                idx_split = np.split(remaining_idx, proportions)
+                
+                for i in range(num_clients):
+                    idx_batch[i].extend(idx_split[i].tolist())
 
         sizes = [len(idx) for idx in idx_batch]
         

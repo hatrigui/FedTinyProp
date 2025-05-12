@@ -109,7 +109,9 @@ class TinyPropLayer:
         # Ensure minimum gradient retention
         min_retention = max(params.S_min, 0.1)  # At least 10% of gradients
         max_retention = min(params.S_max, 0.5)  # At most 50% of gradients
-        return (min_retention + Y * (max_retention - min_retention) / self.Y_max) * (params.zeta ** self.layerPosition)
+        # Add safeguard against Y_max being too small
+        safe_Y_max = max(self.Y_max, 1e-8)
+        return (min_retention + Y * (max_retention - min_retention) / safe_Y_max) * (params.zeta ** self.layerPosition)
 
     def selectGradients(self, grad_output: torch.Tensor, params: TinyPropParams):
         if grad_output.size(1) == 0:
@@ -120,8 +122,10 @@ class TinyPropLayer:
         # Compute gradient importance with better normalization
         Y = grad_output.abs().sum(dim=1)
         max_Y = torch.max(Y)
-        if max_Y > self.Y_max:
-            self.Y_max = max_Y.item()
+        
+        # Only update Y_max if the new value is significant
+        if max_Y > 1e-8:
+            self.Y_max = max(max_Y.item(), 1e-8)  # Ensure Y_max never goes below 1e-8
         
         # Ensure minimum gradient retention
         bpr = self.BPR(params, Y)

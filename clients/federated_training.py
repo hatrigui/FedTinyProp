@@ -70,7 +70,7 @@ def federated_training(
         aggregator_kwargs["dataset_sizes"] = [len(ds) for ds in client_datasets]
 
     metrics_log = {
-        "accuracy": [], "flops": [], "memory": [], "communication": [], "sparsity": [],
+        "accuracy": [], "flops": [], "memory": [], "memory_saved": [], "communication": [], "sparsity": [],
         "avg_grad_norm": [], "phi_k": [], "skipped_batches": [],
         "effective_compute_ratio": [], "compression_ratio": [], "client_eval_history": [],
         "avg_phi_k": [], "avg_loss_change": [], "loss_threshold": [], "skipped_ratio": [],
@@ -181,6 +181,7 @@ def federated_training(
             metrics_log["accuracy"].append(acc)
             metrics_log["flops"].append(sum(client.last_flops for client in clients) / len(clients))
             metrics_log["memory"].append(max(client.last_mem for client in clients))
+            metrics_log["memory_saved"].append(sum(client.last_mem_saved for client in clients) / len(clients))
             metrics_log["communication"].append(sum(client.last_comm for client in clients) / len(clients))
             metrics_log["sparsity"].append(sum(client.last_sparsity for client in clients) / len(clients))
             metrics_log["avg_grad_norm"].append(sum(client.last_avg_grad_norm for client in clients) / len(clients))
@@ -188,6 +189,7 @@ def federated_training(
             metrics_log["skipped_batches"].append(sum(client.num_skipped_batches for client in clients))
             metrics_log["effective_compute_ratio"].append(1 - sum(client.num_skipped_batches for client in clients) / sum(len(client.train_loader) for client in clients))
             metrics_log["compression_ratio"].append(sum(client.compression_ratio for client in clients) / len(clients))
+            
             
             round_quantization_errors = []
             round_scale_factors = []
@@ -213,7 +215,8 @@ def federated_training(
                 metrics_log["memory"],
                 metrics_log["communication"],
                 metrics_log["sparsity"],
-                quantization_errors
+                quantization_errors,
+                memory_saved=metrics_log["memory_saved"]
             )
 
         return (
@@ -221,6 +224,7 @@ def federated_training(
             metrics_log["accuracy"],
             metrics_log["flops"],
             metrics_log["memory"],
+            metrics_log["memory_saved"],
             metrics_log["communication"],
             metrics_log["sparsity"],
             metrics_log["avg_grad_norm"],
@@ -251,7 +255,7 @@ def federated_training(
 
     test_loader = DataLoader(testset, batch_size=32, shuffle=False)
 
-    early_stopper = EarlyStoppingMonitor(patience=early_stopping_patience, delta=early_stopping_delta)
+    early_stopper = None if early_stopping_patience is None or early_stopping_patience <= 0 else EarlyStoppingMonitor(patience=early_stopping_patience, delta=early_stopping_delta)
     sparsifier = AdaptiveSparsifier(initial_sparsity, target_sparsity, rounds, energy_budget=energy_budget)
     history = {k: [] for k in ["train_loss", "train_accuracy", "test_accuracy", "sparsity", "energy", "communication"]}
 
@@ -264,13 +268,13 @@ def federated_training(
         global_params = global_model.state_dict()
         client_deltas = []
         stats = {
-            "flops": 0.0, "memory": 0.0, "communication": 0.0, "sparsity": 0.0,
+            "flops": 0.0, "memory": 0.0, "memory_saved": 0.0, "communication": 0.0, "sparsity": 0.0,
             "grad_norm": 0.0, "phi_k": 0.0, "skipped": 0, "nonzero": 0, "total": 0,
             "effective_compute_ratio": 0.0,
             "avg_phi_k": 0.0,
             "avg_loss_change": 0.0,
             "loss_threshold": 0.0,
-            "skipped_ratio_sum": 0.0,  # Track sum of per-client skipped ratios
+            "skipped_ratio_sum": 0.0,
             "layer_flops": {}
         }
 
@@ -293,6 +297,7 @@ def federated_training(
             # Update statistics
             stats["flops"] += client.last_flops
             stats["memory"] = max(stats["memory"], client.last_mem)
+            stats["memory_saved"] += client.last_mem_saved
             
             # Track layer-wise FLOPs
             if not hasattr(stats, "layer_flops"):
@@ -367,6 +372,7 @@ def federated_training(
         metrics_log["accuracy"].append(acc)
         metrics_log["flops"].append(stats.get("flops", 0.0))
         metrics_log["memory"].append(stats.get("memory", 0.0))
+        metrics_log["memory_saved"].append(stats.get("memory_saved", 0.0))
         metrics_log["communication"].append(stats.get("communication", 0.0))
         metrics_log["sparsity"].append(stats.get("sparsity", 0.0))
         metrics_log["avg_grad_norm"].append(stats.get("grad_norm", 0.0))
@@ -386,10 +392,11 @@ def federated_training(
             append_to_training_log_csv(
                 csv_log_path, rnd + 1, acc, stats["flops"], stats["memory"], stats["communication"],
                 metrics_log["sparsity"][-1], metrics_log["avg_grad_norm"][-1], metrics_log["phi_k"][-1],
-                stats["skipped"], metrics_log["effective_compute_ratio"][-1], metrics_log["compression_ratio"][-1]
+                stats["skipped"], metrics_log["effective_compute_ratio"][-1], metrics_log["compression_ratio"][-1],
+                quantization_error=0.0, avg_scale_factor=1.0, memory_saved=stats["memory_saved"]
             )
 
-        if early_stopper.step(acc, rnd):
+        if early_stopper and early_stopper.step(acc, rnd):
             print(f"\n[Early Stop] Triggered at round {rnd+1}!")
             break
 
@@ -427,28 +434,30 @@ def federated_training(
                 os.path.join(save_dir, f"{partition_type}_{model_name}_training_logs.csv"),
                 metrics_log["accuracy"],
                 metrics_log["flops"],
-                metrics_log["memory"],  
+                metrics_log["memory"],
                 metrics_log["communication"],
                 metrics_log["sparsity"],
-                quantization_errors
+                quantization_errors,
+                memory_saved=metrics_log["memory_saved"]
             )
 
         # Append detailed metrics
         append_to_training_log_csv(
-            os.path.join(save_dir, f"{partition_type}_{model_name}_detailed_logs.csv"),
-            rnd + 1,
-            acc,
-            metrics_log["flops"][-1],
-            metrics_log["memory"][-1],  
-            metrics_log["communication"][-1],
-            metrics_log["sparsity"][-1],
-            metrics_log["avg_grad_norm"][-1],
-            metrics_log["phi_k"][-1],
-            metrics_log["skipped_batches"][-1],
-            metrics_log["effective_compute_ratio"][-1],
-            metrics_log["compression_ratio"][-1],
-            avg_quantization_error,
-            avg_scale_factor
+            filepath=os.path.join(save_dir, f"{partition_type}_{model_name}_detailed_logs.csv"),
+            round_num=rnd + 1,
+            accuracy=acc,
+            flops=metrics_log["flops"][-1],
+            memory_bytes=metrics_log["memory"][-1],
+            memory_saved=metrics_log["memory_saved"][-1],
+            communication_bytes=metrics_log["communication"][-1],
+            sparsity=metrics_log["sparsity"][-1],
+            avg_grad_norm=metrics_log["avg_grad_norm"][-1],
+            avg_phi=metrics_log["phi_k"][-1],
+            skipped_batches=metrics_log["skipped_batches"][-1],
+            effective_compute_ratio=metrics_log["effective_compute_ratio"][-1],
+            compression_ratio=metrics_log["compression_ratio"][-1],
+            quantization_error=avg_quantization_error,
+            avg_scale_factor=avg_scale_factor
         )
 
     return (
@@ -456,6 +465,7 @@ def federated_training(
         metrics_log["accuracy"],
         metrics_log["flops"],
         metrics_log["memory"],
+        metrics_log["memory_saved"],
         metrics_log["communication"],
         metrics_log["sparsity"],
         metrics_log["avg_grad_norm"],

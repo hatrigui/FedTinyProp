@@ -108,22 +108,19 @@ class TinyProp1DCNN(nn.Module):
         self.tpParams = tinyprop_params
         self.current_round = 0  
         
-        self.conv1 = TinyPropConv1d(1, 64, kernel_size=5, stride=1, padding=2, 
-                                   tinyPropParams=tinyprop_params, layer_number=1)
+        self.conv1 = nn.Conv1d(1, 64, kernel_size=5, stride=1, padding=2)
         self.bn1 = nn.BatchNorm1d(64)
         
-        self.conv2 = TinyPropConv1d(64, 128, kernel_size=5, stride=1, padding=2,
-                                   tinyPropParams=tinyprop_params, layer_number=2)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, stride=1, padding=2)
         self.bn2 = nn.BatchNorm1d(128)
         
-        self.conv3 = TinyPropConv1d(128, 256, kernel_size=5, stride=1, padding=2,
-                                   tinyPropParams=tinyprop_params, layer_number=3)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=5, stride=1, padding=2)
         self.bn3 = nn.BatchNorm1d(256)
         
         self.global_pool = nn.AdaptiveAvgPool1d(1)
         
-        self.fc1 = TinyPropLinear(256, 128, tinyPropParams=tinyprop_params, layer_number=4)
-        self.fc2 = TinyPropLinear(128, num_classes, tinyPropParams=tinyprop_params, layer_number=5)
+        self.fc1 = nn.Linear(256, 128)
+        self.fc2 = nn.Linear(128, num_classes)
         
         # Dropout
         self.dropout = nn.Dropout(0.5)
@@ -156,6 +153,48 @@ class TinyProp1DCNN(nn.Module):
         x = self.fc2(x)
         
         return x
+    
+    
+    
+class TinyPropMFCC1DCNN(nn.Module):
+    def __init__(self, tinyprop_params: TinyPropParams, num_classes: int = 35, input_dims=(1, 40, 81)):
+        super().__init__()
+        self.tpLayer = TinyPropLayer(tinyprop_params.number_of_layers)
+        self.tpParams = tinyprop_params
+
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+
+        self.pool = nn.MaxPool2d(kernel_size=(1, 2))  # downsample only time
+
+        # 1D conv over time axis after squeezing freq dimension
+        self.temporal_conv = nn.Conv1d(in_channels=32 * 40, out_channels=128, kernel_size=3, padding=1)
+
+        self.fc1 = nn.Linear(128, 64)
+        self.fc2 = nn.Linear(64, num_classes)
+        self.dropout = nn.Dropout(0.3)
+    @property
+    def phi_k(self):
+        """Get the current phi_k value from the TinyPropLayer's history."""
+        history = self.tpLayer.stats.get("phi_k_history", [])
+        return history[-1] if history else 0.0
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))  # [B, 16, 40, T]
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))  # [B, 32, 40, T/2]
+
+        B, C, H, W = x.shape
+        x = x.view(B, C * H, W)  # → [B, 32*40, T/2]
+
+        x = self.temporal_conv(x)  # → [B, 128, T/2]
+        x = F.adaptive_avg_pool1d(x, 1).squeeze(-1)  # → [B, 128]
+
+        x = self.dropout(F.relu(self.fc1(x)))
+        x = self.fc2(x)
+        return x
+
 
 def get_tinyprop_model(dataset_name, tinyprop_params):
     dataset_name = dataset_name.lower()
@@ -167,6 +206,8 @@ def get_tinyprop_model(dataset_name, tinyprop_params):
     elif dataset_name == "cifar100":
         return TinyPropResNet8(num_classes=100, tinyprop_params=tinyprop_params)
     elif dataset_name == "har":
-        return TinyProp1DCNN(tinyprop_params=tinyprop_params, num_classes=6)  
+        return TinyProp1DCNN(tinyprop_params=tinyprop_params, num_classes=6)
+    elif dataset_name == "speechcommands":
+        return TinyPropMFCC1DCNN(tinyprop_params=tinyprop_params, num_classes=35)  
     else:
         raise ValueError(f"No model defined for dataset: {dataset_name}")
