@@ -1,4 +1,7 @@
 import torch
+import numpy as np
+from typing import List, Dict, Optional
+from models.model import get_tinyprop_model
 
 def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_params, dataset_sizes, **kwargs):
     """Aggregate sparse updates from clients using FedAvg with quantization-aware aggregation."""
@@ -115,4 +118,42 @@ def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_p
     print(f"Average quantization error: {stats['quantization_error']:.6f}")
     
     global_model.load_state_dict(updated_state)
+    return global_model
+
+def standard_fedavg_aggregate(client_deltas, global_model, model_name, tinyprop_params, **kwargs):
+    """Standard FedAvg aggregation for dense models."""
+    # Get dataset sizes for weighted averaging
+    dataset_sizes = kwargs.get("dataset_sizes", None)
+    if dataset_sizes is None:
+        # If no dataset sizes provided, use equal weights
+        weights = [1.0 / len(client_deltas)] * len(client_deltas)
+    else:
+        total_size = sum(dataset_sizes)
+        weights = [size / total_size for size in dataset_sizes]
+
+    # Initialize aggregated parameters
+    aggregated_params = {}
+    for name, param in global_model.state_dict().items():
+        if param.requires_grad:
+            aggregated_params[name] = torch.zeros_like(param)
+
+    # Aggregate updates from all clients
+    for client_idx, deltas in enumerate(client_deltas):
+        weight = weights[client_idx]
+        for name, param in global_model.state_dict().items():
+            if param.requires_grad and name in deltas:
+                if isinstance(deltas[name], tuple):
+                    indices, values = deltas[name]
+                    if isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
+                        param.view(-1)[indices] += values * weight
+                else:
+                    aggregated_params[name] += deltas[name] * weight
+
+    # Update global model
+    state_dict = global_model.state_dict()
+    for name, param in state_dict.items():
+        if param.requires_grad:
+            state_dict[name] = aggregated_params[name]
+    global_model.load_state_dict(state_dict)
+
     return global_model

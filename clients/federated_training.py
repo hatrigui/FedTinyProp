@@ -3,16 +3,16 @@ import torch
 from torch.utils.data import DataLoader
 from clients.federated_client import FederatedClient
 from models.model import get_tinyprop_model 
-from models.config import get_tinyprop_config
+from models.config import get_tinyprop_config, get_dense_config
 from utils.early_stopping import EarlyStoppingMonitor
 from utils.save_results import append_to_training_log_csv, save_training_logs_csv
-
 from utils.adaptive_sparsification import AdaptiveSparsifier
 from models.model import get_tinyprop_model
-from clients.aggregators import sparse_fedavg_aggregate
+from clients.aggregators import sparse_fedavg_aggregate, standard_fedavg_aggregate
+from utils.adaptive_sparsification import AdaptiveSparsifier
+from models.tinyProp import get_phi_k
 import numpy as np
 import random
-from models.tinyProp import get_phi_k
 import os
 
 def evaluate_model(model, data_loader):
@@ -55,7 +55,8 @@ def federated_training(
     seed: int = 42,
     save_dir=None,
     save_interval=1,
-    quantization_bits=8
+    quantization_bits=8,
+    use_dense_baseline: bool = False
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -77,14 +78,22 @@ def federated_training(
         "quantization_errors": [], "avg_scale_factors": []
     }
 
-    config = get_tinyprop_config(model_name)
+    # Use dense config if specified
+    if use_dense_baseline:
+        config = get_dense_config(model_name)
+        tinyprop_params = config["tinyprop_params"]
+        # Use standard FedAvg for dense baseline
+        aggregator_fn = standard_fedavg_aggregate
+    else:
+        config = get_tinyprop_config(model_name)
+
     global_model = get_tinyprop_model(model_name, tinyprop_params)
 
     if num_clients is not None and num_rounds is not None and partition_type is not None and alpha is not None:
         print(f"\n[Training Debug] Starting federated training with {num_clients} clients")
         print(f"[Training Debug] Partition type: {partition_type}, alpha: {alpha}")
         
-        global_model = get_tinyprop_model(model_name, tinyprop_params)
+        global_model = get_tinyprop_model(model_name, config["tinyprop_params"])
         global_params = global_model.state_dict()
         clients = []
         dataset_sizes = []

@@ -141,8 +141,40 @@ def get_tinyprop_config(dataset_name):
                 "hop_length": 512
             }
         }
+        
 
     
 
     else:
         raise ValueError(f"No config defined for dataset: {dataset_name}")
+
+
+def get_dense_config(dataset_name):
+    """Get configuration for dense baseline model (no sparsity or skipping)."""
+    dataset_name = dataset_name.lower()
+
+    dense_params = TinyPropParams(
+        S_min=0.0,
+        S_max=0.0,
+        zeta=0.0,
+        number_of_layers=5,  # Will be overridden by dataset-specific config
+        random_skip=False
+    )
+
+    base_cfg = get_tinyprop_config(dataset_name)
+    base_cfg["tinyprop_params"] = dense_params
+    base_cfg["skip_threshold"] = float("inf")  # Disable skipping
+    base_cfg["phi_min"] = 0.0  # Ensure no gradient masking
+    base_cfg["quantization"]["enabled"] = False  # Disable quantization for dense baseline
+    
+    # Override number of layers based on dataset
+    if dataset_name in ["mnist", "fashionmnist"]:
+        base_cfg["tinyprop_params"].number_of_layers = 4
+    elif dataset_name in ["cifar10", "cifar100"]:
+        base_cfg["tinyprop_params"].number_of_layers = 11
+    elif dataset_name == "har":
+        base_cfg["tinyprop_params"].number_of_layers = 5
+    elif dataset_name == "speechcommands":
+        base_cfg["tinyprop_params"].number_of_layers = 6
+    
+    return base_cfg

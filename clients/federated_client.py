@@ -27,6 +27,14 @@ class FederatedClient(fl.client.NumPyClient):
         self.model.to(self.device)
         self.dataset_name = dataset_name
         
+        # Check if we're using dense baseline
+        self.is_dense_baseline = (
+            self.cfg["tinyprop_params"].S_min == 0.0 and 
+            self.cfg["tinyprop_params"].S_max == 0.0 and 
+            self.cfg["tinyprop_params"].zeta == 0.0 and
+            self.cfg.get("skip_threshold", float("inf")) == float("inf")
+        )
+        
         self.metrics = {
             'round': [],
             'loss': [],
@@ -79,7 +87,7 @@ class FederatedClient(fl.client.NumPyClient):
         self.S_min = tinyprop_params.S_min
         self.S_max = tinyprop_params.S_max
         self.zeta = tinyprop_params.zeta
-        self.skip_threshold = self.cfg.get("skip_threshold", 2.5)
+        self.skip_threshold = self.cfg.get("skip_threshold", float("inf"))
         self.phi_min = self.cfg.get("phi_min", 0.2)
         
         self.sparsifier = AdaptiveSparsifier(
@@ -212,10 +220,15 @@ class FederatedClient(fl.client.NumPyClient):
 
     def should_skip_update(self, current_grad_norm: float) -> bool:
         """Determine if the current update should be skipped based on gradient norm."""
+        if self.is_dense_baseline:
+            return False
         return current_grad_norm < self.skip_threshold
 
     def apply_gradient_sparsification(self, phi: float) -> None:
         """Apply gradient sparsification with top-k selection."""
+        if self.is_dense_baseline:
+            return  # Skip sparsification for dense baseline
+            
         total_nonzero = 0
         total_elements = 0
         
@@ -406,30 +419,37 @@ class FederatedClient(fl.client.NumPyClient):
                 if grad_norm > 0:
                     epoch_grad_norms.append(grad_norm)
                     
-                    self.model.tpLayer.update_phi(self.model.tpParams, loss.item(), batch_idx)
+                    # Skip batch skipping logic for dense baseline
+                    if not self.is_dense_baseline:
+                        self.model.tpLayer.update_phi(self.model.tpParams, loss.item(), batch_idx)
+                        
+                        if self.model.tpLayer.should_skip_batch(loss.item(), self.model.tpParams):
+                            self.num_skipped_batches += 1
+                            continue
                     
-                    if self.model.tpLayer.should_skip_batch(loss.item(), self.model.tpParams):
-                        self.num_skipped_batches += 1
-                        continue
-                    if self.adaptive_sparsity:
-                        phi = self.update_adaptive_sparsity(grad_norm)
-                        
-                        self.apply_gradient_sparsification(phi)
-                        
-                        base_sparsity = self.S_min + (self.S_max - self.S_min) * (1 - phi)
-                        local_sparsity = min(self.S_max, base_sparsity * progressive_factor)
-                        epoch_effective_sparsities.append(local_sparsity)
-                        
-                        # Calculate FLOPs for the entire batch at once
-                        batch_flops, _ = compute_model_flops(self.model, inputs.shape, self.layer_sparsity)
-                        total_flops += batch_flops
-                        
-                        # Debug logging for first batch
-                        if batch_idx == 0:
-                            per_sample_flops = batch_flops / inputs.shape[0]
-                            print(f"[Debug] Per-sample FLOPs: {per_sample_flops:.2f}")
-                            print(f"[Debug] Batch size: {inputs.shape[0]}")
-                            print(f"[Debug] Total batch FLOPs: {batch_flops:.2f}")
+                    # Always calculate FLOPs, regardless of mode
+                    if self.is_dense_baseline:
+                        # For dense baseline, use zero sparsity
+                        layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
+                    else:
+                        if self.adaptive_sparsity:
+                            phi = self.update_adaptive_sparsity(grad_norm)
+                            self.apply_gradient_sparsification(phi)
+                            base_sparsity = self.S_min + (self.S_max - self.S_min) * (1 - phi)
+                            local_sparsity = min(self.S_max, base_sparsity * progressive_factor)
+                            epoch_effective_sparsities.append(local_sparsity)
+                        layer_sparsity = self.layer_sparsity
+                    
+                    # Calculate FLOPs for the entire batch
+                    batch_flops, _ = compute_model_flops(self.model, inputs.shape, layer_sparsity)
+                    total_flops += batch_flops
+                    
+                    # Debug logging for first batch
+                    if batch_idx == 0:
+                        per_sample_flops = batch_flops / inputs.shape[0]
+                        print(f"[Debug] Per-sample FLOPs: {per_sample_flops:.2f}")
+                        print(f"[Debug] Batch size: {inputs.shape[0]}")
+                        print(f"[Debug] Total batch FLOPs: {batch_flops:.2f}")
                 
                 self.optimizer.step()
                 
