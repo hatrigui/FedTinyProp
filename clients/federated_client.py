@@ -18,12 +18,13 @@ from utils.memory_calculator import estimate_model_memory
 class FederatedClient(fl.client.NumPyClient):
     def __init__(self, client_id: int, model: nn.Module, train_loader: DataLoader, 
                  test_loader: DataLoader, cfg: dict, device: str = None, dataset_name: str = None):
+        super().__init__()
         self.client_id = client_id
         self.model = model
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.cfg = cfg
-        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.dataset_name = dataset_name
         
@@ -128,14 +129,43 @@ class FederatedClient(fl.client.NumPyClient):
                 "loss_threshold": 0.01
             }
         
-        quantization_cfg = cfg.get("quantization", {"bits": 32, "enabled": False})
-        self.quantization_bits = quantization_cfg.get("bits", 32)
+        quantization_cfg = cfg.get("quantization", {
+            "bits": 8,
+            "enabled": False,
+            "adaptive": True,
+            "min_bits": 4,
+            "max_bits": 16,
+            "layer_specific": True,
+            "error_threshold": 0.01,
+            "momentum": 0.9
+        })
+        self.quantization_bits = quantization_cfg.get("bits", 8)
         self.quantization_enabled = quantization_cfg.get("enabled", False)
+        self.adaptive_quantization = quantization_cfg.get("adaptive", True)
+        self.min_bits = quantization_cfg.get("min_bits", 4)
+        self.max_bits = quantization_cfg.get("max_bits", 16)
+        self.layer_specific = quantization_cfg.get("layer_specific", True)
+        self.error_threshold = quantization_cfg.get("error_threshold", 0.01)
+        self.quantization_momentum = quantization_cfg.get("momentum", 0.9)
+        
         self.quantization_error = 0.0
         self.avg_scale_factor = 1.0
+        self.layer_quantization_stats = {}
         self.quantization_metrics = {
             "errors": [],
-            "scale_factors": []
+            "scale_factors": [],
+            "layer_bits": {},
+            "layer_errors": {},
+            "layer_scale_factors": {}
+        }
+
+        self.communication_metrics = {
+            'download_bytes': 0.0,
+            'upload_bytes': 0.0,
+            'total_bytes': 0.0,
+            'compression_ratio': 1.0,
+            'model_size_bytes': 0.0,
+            'layer_communications': {}
         }
 
     def get_parameters(self):
@@ -149,17 +179,19 @@ class FederatedClient(fl.client.NumPyClient):
             state_dict[key] = param.to(self.device)
         self.model.load_state_dict(state_dict)
 
-    def get_metrics(self):
+    def get_metrics(self) -> Dict[str, float]:
+        """Get client metrics."""
         return {
             'flops': self.last_flops,
             'memory': self.last_mem,
+            'memory_saved': self.last_mem_saved,
             'communication': self.last_comm,
             'sparsity': self.last_sparsity,
-            'grad_norm': self.last_avg_grad_norm,
-            'phi': self.last_phi,
             'skipped_batches': self.num_skipped_batches,
-            'compression_ratio': self.compression_ratio,
-            'layer_sparsity': self.layer_sparsity
+            'download_bytes': self.communication_metrics['download_bytes'],
+            'upload_bytes': self.communication_metrics['upload_bytes'],
+            'model_size_bytes': self.communication_metrics['model_size_bytes'],
+            'compression_ratio': self.communication_metrics['compression_ratio']
         }
 
     def fit(self, parameters, config):
@@ -269,46 +301,153 @@ class FederatedClient(fl.client.NumPyClient):
             "memory_saved": 0.0,
             "communication": 0.0,
             "sparsity": 0.0,
-            "layer_flops": {}
+            "layer_flops": {},
+            "download_bytes": 0.0,
+            "upload_bytes": 0.0,
+            "compression_ratio": 1.0,
+            "model_size_bytes": 0.0
         }
 
-        sample_input, _ = next(iter(self.train_loader))
-        single_sample_shape = (1, *sample_input.shape[1:])
-        _, layer_flops = compute_model_flops(
-            self.model,
-            single_sample_shape,
-            layer_sparsity_dict=self.layer_sparsity
-        )
-        metrics["layer_flops"] = {k: v * sample_input.shape[0] for k, v in layer_flops.items()}
-        metrics["sparsity"] = np.mean(list(self.layer_sparsity.values()))
+        # Calculate model size and memory metrics
+        total_params = 0
+        total_nonzero = 0
+        total_memory = 0
+        total_memory_saved = 0
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param_size = param.numel()
+                total_params += param_size
+                
+                # Calculate memory for dense parameter (4 bytes per float32)
+                dense_memory = param_size * 4
+                total_memory += dense_memory
+                
+                # Calculate memory for sparse parameter if applicable
+                if name in self.weight_deltas:
+                    update_data = self.weight_deltas[name]
+                    if isinstance(update_data, tuple):
+                        indices, values = update_data
+                        if isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
+                            # Calculate sparse memory (indices + values + overhead)
+                            max_index = param_size - 1
+                            if max_index <= 255:  # uint8
+                                index_bytes = 1
+                            elif max_index <= 65535:  # uint16
+                                index_bytes = 2
+                            else:  # uint32
+                                index_bytes = 4
+                            
+                            sparse_memory = (indices.numel() * index_bytes +  # indices
+                                           values.numel() * 4 +              # values (float32)
+                                           3)                               # format overhead
+                            
+                            # Only use sparse if it's more efficient
+                            if sparse_memory < dense_memory:
+                                total_memory_saved += (dense_memory - sparse_memory)
+                                total_nonzero += indices.numel()
+                            else:
+                                total_nonzero += param_size
+                        else:
+                            total_nonzero += param_size
+                    else:
+                        total_nonzero += param_size
+                else:
+                    total_nonzero += param_size
 
-        input_shape = sample_input.shape[1:]
-        mem_report = estimate_model_memory(self.model, batch_size=sample_input.shape[0], input_shape=input_shape)
-        batch_memory = mem_report["total_MB"]
-        total_batches = len(self.train_loader)
-        processed_batches = total_batches - self.num_skipped_batches
-        skipped_batches = self.num_skipped_batches
+        # Calculate model size for download cost (full model)
+        model_size_bytes = total_memory
+        metrics["model_size_bytes"] = model_size_bytes
+        metrics["download_bytes"] = model_size_bytes  # Each client downloads full model
+        metrics["memory"] = total_memory / (1024 * 1024)  # Convert to MB
+        metrics["memory_saved"] = total_memory_saved / (1024 * 1024)  # Convert to MB
 
-        # Calculate memory used for processed batches
-        used_memory = processed_batches * batch_memory
-        # Calculate memory saved (difference between total and used)
-        saved_memory = skipped_batches * batch_memory
+        # Calculate sparse upload cost with optimized format
+        upload_bytes = 0
+        layer_communications = {}
+        
+        # Higher threshold for significant updates
+        SIGNIFICANT_THRESHOLD = 1e-4  # Increased from 1e-6
+        
+        for name, update_data in self.weight_deltas.items():
+            if isinstance(update_data, tuple):
+                indices, values = update_data
+                if not isinstance(indices, torch.Tensor) or not isinstance(values, torch.Tensor):
+                    continue
+                    
+                param = self.model.state_dict()[name]
+                
+                # Only keep significant updates
+                mask = values.abs() > SIGNIFICANT_THRESHOLD
+                indices = indices[mask]
+                values = values[mask]
+                
+                if indices.numel() == 0:
+                    continue
+                
+                # Optimize index storage
+                max_index = param.numel() - 1
+                if max_index <= 255:  # Can use uint8
+                    indices = indices.to(torch.uint8)
+                    index_bytes = 1
+                elif max_index <= 65535:  # Can use uint16
+                    indices = indices.to(torch.uint16)
+                    index_bytes = 2
+                else:  # Must use uint32
+                    indices = indices.to(torch.uint32)
+                    index_bytes = 4
+                
+                # Calculate bytes needed for this layer's update
+                indices_bytes = indices.numel() * index_bytes
+                values_bytes = values.numel() * 4  # float32 = 4 bytes
+                format_overhead = 3  # Reduced format overhead
+                
+                # Calculate total bytes for this layer
+                layer_comm = indices_bytes + values_bytes + format_overhead
+                
+                # Only use sparse format if it's more efficient than dense
+                dense_layer_bytes = param.numel() * 4
+                if layer_comm >= dense_layer_bytes:
+                    # Fall back to dense format
+                    layer_comm = dense_layer_bytes
+                    self.weight_deltas[name] = (None, param.data.cpu())
+                
+                upload_bytes += layer_comm
+                layer_communications[name] = layer_comm
+            else:
+                # Handle dense update
+                param = self.model.state_dict()[name]
+                upload_bytes += param.numel() * 4
+                layer_communications[name] = param.numel() * 4
 
-        metrics["memory"] = used_memory
-        metrics["memory_saved"] = saved_memory
+        metrics["upload_bytes"] = upload_bytes
+        metrics["communication"] = upload_bytes + model_size_bytes  # Total = upload + download
+        metrics["layer_communication"] = layer_communications
+        
+        # Calculate effective compression ratio
+        if upload_bytes > 0:
+            metrics["compression_ratio"] = model_size_bytes / upload_bytes
+        else:
+            metrics["compression_ratio"] = 1.0
+            
+        # Calculate effective sparsity
+        if total_params > 0:
+            metrics["sparsity"] = 1.0 - (total_nonzero / total_params)
+        
+        # Store metrics for logging
+        self.last_comm = metrics["communication"]
         self.last_mem = metrics["memory"]
         self.last_mem_saved = metrics["memory_saved"]
-
-        total_bytes = sum(
-            indices.numel() * indices.element_size() + values.numel() * values.element_size()
-            for indices, values in self.weight_deltas.values()
-        )
-        metrics["communication"] = total_bytes
-        original_size = sum(p.numel() * 4 for p in self.model.parameters() if p.requires_grad)
-        metrics["compression_ratio"] = total_bytes / original_size if original_size else 1.0
-
+        self.communication_metrics = {
+            'download_bytes': metrics["download_bytes"],
+            'upload_bytes': metrics["upload_bytes"],
+            'total_bytes': metrics["communication"],
+            'compression_ratio': metrics["compression_ratio"],
+            'model_size_bytes': metrics["model_size_bytes"],
+            'layer_communications': layer_communications
+        }
+        
         return metrics
-
 
     def get_quantization_metrics(self) -> Tuple[float, float]:
         """Return the current quantization error and average scale factor."""
@@ -318,16 +457,102 @@ class FederatedClient(fl.client.NumPyClient):
             return np.mean(self.quantization_metrics["errors"]), np.mean(self.quantization_metrics["scale_factors"])
         return 0.0, 1.0
 
-    def apply_quantization(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
-        """Apply quantization to a tensor and return the quantized tensor, error, and scale factor."""
-        if not self.quantization_enabled or self.quantization_bits == 32:
+    def get_layer_optimal_bits(self, tensor: torch.Tensor, layer_name: str) -> int:
+        """Determine optimal bit-width for a layer based on its statistics."""
+        if not self.adaptive_quantization or not self.layer_specific:
+            return self.quantization_bits
+            
+        if layer_name not in self.layer_quantization_stats:
+            self.layer_quantization_stats[layer_name] = {
+                "max_val": 0.0,
+                "min_val": 0.0,
+                "mean": 0.0,
+                "std": 0.0,
+                "error": 0.0,
+                "bits": self.quantization_bits
+            }
+            
+        stats = self.layer_quantization_stats[layer_name]
+        
+        # Update statistics with momentum
+        current_max = tensor.abs().max().item()
+        current_min = tensor.abs().min().item()
+        current_mean = tensor.abs().mean().item()
+        current_std = tensor.abs().std().item()
+        
+        stats["max_val"] = self.quantization_momentum * stats["max_val"] + (1 - self.quantization_momentum) * current_max
+        stats["min_val"] = self.quantization_momentum * stats["min_val"] + (1 - self.quantization_momentum) * current_min
+        stats["mean"] = self.quantization_momentum * stats["mean"] + (1 - self.quantization_momentum) * current_mean
+        stats["std"] = self.quantization_momentum * stats["std"] + (1 - self.quantization_momentum) * current_std
+        
+        # Calculate dynamic range
+        dynamic_range = stats["max_val"] - stats["min_val"]
+        if dynamic_range < 1e-6:
+            return self.min_bits
+            
+        # Calculate signal-to-noise ratio (SNR)
+        snr = 20 * np.log10(stats["mean"] / (stats["std"] + 1e-6))
+        
+        # Adjust bits based on SNR and error threshold
+        if snr > 40:  # High SNR, can use fewer bits
+            target_bits = max(self.min_bits, int(self.quantization_bits * 0.75))
+        elif snr < 20:  # Low SNR, need more bits
+            target_bits = min(self.max_bits, int(self.quantization_bits * 1.25))
+        else:
+            target_bits = self.quantization_bits
+            
+        # Adjust based on previous error
+        if stats["error"] > self.error_threshold:
+            target_bits = min(self.max_bits, target_bits + 1)
+        elif stats["error"] < self.error_threshold * 0.5:
+            target_bits = max(self.min_bits, target_bits - 1)
+            
+        return target_bits
+
+    def apply_quantization(self, tensor: torch.Tensor, layer_name: str = None) -> Tuple[torch.Tensor, float, float]:
+        """Apply adaptive quantization to a tensor and return the quantized tensor, error, and scale factor."""
+        if not self.quantization_enabled:
             return tensor, 0.0, 1.0
             
+        # Determine optimal bit-width for this layer
+        bits = self.get_layer_optimal_bits(tensor, layer_name) if layer_name else self.quantization_bits
+        
+        # Calculate scale factor based on dynamic range
         max_val = tensor.abs().max().item()
-        scale_factor = (2 ** (self.quantization_bits - 1) - 1) / max_val if max_val > 0 else 1.0
+        if max_val < 1e-6:
+            return tensor, 0.0, 1.0
+            
+        scale_factor = (2 ** (bits - 1) - 1) / max_val
         quantized = torch.round(tensor * scale_factor) / scale_factor
         
+        # Calculate quantization error
         error = torch.mean((tensor - quantized).abs()).item()
+        
+        # Update layer statistics
+        if layer_name:
+            if layer_name not in self.layer_quantization_stats:
+                self.layer_quantization_stats[layer_name] = {
+                    "max_val": 0.0,
+                    "min_val": 0.0,
+                    "mean": 0.0,
+                    "std": 0.0,
+                    "error": 0.0,
+                    "bits": bits
+                }
+            self.layer_quantization_stats[layer_name]["error"] = error
+            self.layer_quantization_stats[layer_name]["bits"] = bits
+            
+            # Update layer metrics
+            if layer_name not in self.quantization_metrics["layer_errors"]:
+                self.quantization_metrics["layer_errors"][layer_name] = []
+                self.quantization_metrics["layer_scale_factors"][layer_name] = []
+                self.quantization_metrics["layer_bits"][layer_name] = []
+            
+            self.quantization_metrics["layer_errors"][layer_name].append(error)
+            self.quantization_metrics["layer_scale_factors"][layer_name].append(scale_factor)
+            self.quantization_metrics["layer_bits"][layer_name].append(bits)
+        
+        # Update global metrics
         self.quantization_metrics["errors"].append(error)
         self.quantization_metrics["scale_factors"].append(scale_factor)
         
@@ -371,6 +596,14 @@ class FederatedClient(fl.client.NumPyClient):
         loss_window_size = 5
         zeta_adjustment_threshold = 0.01  # Minimum loss change to trigger zeta adjustment
         
+        # Get initial memory estimate
+        sample_input, _ = next(iter(self.train_loader))
+        mem_report = estimate_model_memory(self.model, batch_size=sample_input.shape[0], input_shape=sample_input.shape[1:])
+        total_memory = mem_report["total_MB"]
+        
+        # Initialize layer sparsity for FLOPs calculation
+        layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
+        
         for epoch in range(num_epochs):
             for batch_idx, (inputs, targets) in enumerate(self.train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
@@ -388,19 +621,16 @@ class FederatedClient(fl.client.NumPyClient):
                 if len(loss_history) == loss_window_size:
                     loss_change = abs(loss_history[-1] - loss_history[0])
                     if loss_change < zeta_adjustment_threshold:
-                        # Loss is plateauing, increase zeta to maintain sparsity
-                        self.zeta *= 1.05  # 5% increase
+                        self.zeta *= 1.05
                     elif loss_change > zeta_adjustment_threshold * 2:
-                        # Loss is changing significantly, decrease zeta to allow more updates
-                        self.zeta *= 0.95  # 5% decrease
-                    # Keep zeta within reasonable bounds
+                        self.zeta *= 0.95
                     self.zeta = max(0.1, min(2.0, self.zeta))
                 
                 loss.backward()
                 if self.quantization_enabled:
-                    for param in self.model.parameters():
+                    for name, param in self.model.named_parameters():
                         if param.grad is not None:
-                            quantized_grad, error, scale = self.apply_quantization(param.grad)
+                            quantized_grad, error, scale = self.apply_quantization(param.grad, name)
                             param.grad.data = quantized_grad
                 
                 grad_norm = 0.0
@@ -409,7 +639,6 @@ class FederatedClient(fl.client.NumPyClient):
                         grad_norm += p.grad.data.norm(2).item() ** 2
                 grad_norm = grad_norm ** 0.5
                 
-                # Apply gradient clipping
                 if grad_norm > grad_clip_threshold:
                     scale = grad_clip_threshold / (grad_norm + 1e-6)
                     for p in self.model.parameters():
@@ -427,7 +656,7 @@ class FederatedClient(fl.client.NumPyClient):
                             self.num_skipped_batches += 1
                             continue
                     
-                    # Always calculate FLOPs, regardless of mode
+                    # Calculate FLOPs only for non-skipped batches
                     if self.is_dense_baseline:
                         # For dense baseline, use zero sparsity
                         layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
@@ -438,44 +667,26 @@ class FederatedClient(fl.client.NumPyClient):
                             base_sparsity = self.S_min + (self.S_max - self.S_min) * (1 - phi)
                             local_sparsity = min(self.S_max, base_sparsity * progressive_factor)
                             epoch_effective_sparsities.append(local_sparsity)
-                        layer_sparsity = self.layer_sparsity
+                            # Update layer sparsity for FLOPs calculation
+                            layer_sparsity = {name: local_sparsity for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
                     
-                    # Calculate FLOPs for the entire batch
+                    # Calculate FLOPs for the current batch
                     batch_flops, _ = compute_model_flops(self.model, inputs.shape, layer_sparsity)
                     total_flops += batch_flops
                     
-                    # Debug logging for first batch
-                    if batch_idx == 0:
-                        per_sample_flops = batch_flops / inputs.shape[0]
-                        print(f"[Debug] Per-sample FLOPs: {per_sample_flops:.2f}")
-                        print(f"[Debug] Batch size: {inputs.shape[0]}")
-                        print(f"[Debug] Total batch FLOPs: {batch_flops:.2f}")
-                
+
                 self.optimizer.step()
                 
                 total_loss += loss.item()
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
-                
-                process = psutil.Process(os.getpid())
-                total_memory = max(total_memory, process.memory_info().rss / 1024 / 1024)
-                
-                if batch_idx % 10 == 0:
-                    print(f"\n[Batch {batch_idx}] Debug Info:")
-                    print(f"  - Loss: {loss.item():.4f}")
-                    print(f"  - Grad Norm: {grad_norm:.4f}")
-                    print(f"  - Current phi_k: {self.model.phi_k:.4f}")
-                    print(f"  - Current zeta: {self.zeta:.4f}")
-                    print(f"  - Skipped batches: {self.num_skipped_batches}")
-                    print(f"  - Memory usage: {total_memory:.2f} MB")
             
             if self.scheduler is not None:
                 self.scheduler.step()
         
         self.last_flops = total_flops
         self.last_mem = total_memory
-        self.last_comm = total_communication
         self.last_sparsity = np.mean(epoch_effective_sparsities) if epoch_effective_sparsities else 0.0
         self.last_avg_grad_norm = np.mean(epoch_grad_norms) if epoch_grad_norms else 0.0
         self.last_phi = self.model.phi_k
@@ -486,8 +697,11 @@ class FederatedClient(fl.client.NumPyClient):
                 initial = initial_weights[name]
                 final = param.data
                 delta = final - initial
+                
                 if delta.numel() > 0:
-                    mask = delta.abs() > 1e-6  
+                    # Use higher threshold for significant updates
+                    mask = delta.abs() > 1e-4  # Increased from 1e-6
+                    
                     if len(delta.shape) > 1:
                         flat_delta = delta.view(-1)
                         flat_mask = mask.view(-1)
@@ -497,8 +711,16 @@ class FederatedClient(fl.client.NumPyClient):
                         indices = mask.nonzero().squeeze()
                         values = delta[indices]
                     
-                    if indices.numel() > 0:  
-                        self.weight_deltas[name] = (indices, values)
+                    if indices.numel() > 0:
+                        # Only store if sparse format would be more efficient
+                        param_size = param.numel() * 4  # dense size in bytes
+                        sparse_size = (indices.numel() * (2 if param.numel() <= 65535 else 4) + 
+                                     values.numel() * 4 + 3)  # sparse size with overhead
+                        
+                        if sparse_size < param_size:
+                            self.weight_deltas[name] = (indices, values)
+                        else:
+                            self.weight_deltas[name] = (None, param.data.cpu())  # Store full parameter
         
         return total_loss / len(self.train_loader), 100. * correct / total
 
@@ -515,8 +737,3 @@ class FederatedClient(fl.client.NumPyClient):
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
         return correct / total
-
-    def _save_metrics_to_csv(self):
-        """Save client metrics to CSV file."""
-        df = pd.DataFrame(self.metrics)
-        df.to_csv(f"client_{self.client_id}_metrics.csv", index=False)

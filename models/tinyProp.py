@@ -229,14 +229,7 @@ class TinyPropLayer:
             self.phi_k_history = []
         self.phi_k_history.append(self.phi_k)
         
-        # Debug logging
-        if batch_idx % 5 == 0:
-            print(f"[Debug][Batch {batch_idx}] Loss: {loss:.4f}")
-            print(f"[Debug][Batch {batch_idx}] Loss Change: {loss_change:.4f}")
-            print(f"[Debug][Batch {batch_idx}] Relative Loss Change: {relative_loss_change:.4f}")
-            print(f"[Debug][Batch {batch_idx}] Phi Update: {phi_update:.4f}")
-            print(f"[Debug][Batch {batch_idx}] New phi_k: {self.phi_k:.4f}")
-            print(f"[Debug] phi_k_history: {self.phi_k_history}")
+        
 
     def should_skip_batch(self, loss: float, params: TinyPropParams) -> bool:
         """Determine if the current batch should be skipped based on loss and phi_k."""

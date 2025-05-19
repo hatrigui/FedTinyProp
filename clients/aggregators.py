@@ -3,103 +3,107 @@ import numpy as np
 from typing import List, Dict, Optional
 from models.model import get_tinyprop_model
 
-def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_params, dataset_sizes, **kwargs):
+def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_params, **kwargs):
     """Aggregate sparse updates from clients using FedAvg with quantization-aware aggregation."""
-    total_samples = sum(dataset_sizes)
-    if total_samples == 0:
-        print("[Server Debug] Warning: Total samples is 0, skipping aggregation")
-        return global_model
-        
-    global_state = global_model.state_dict()
-    updated_state = {k: v.clone().float() for k, v in global_state.items()}
+    updated_state = global_model.state_dict()
+    
+    # Calculate model size once
+    model_size_bytes = sum(p.numel() * 4 for p in global_model.parameters())
     
     stats = {
         "total_updates": len(sparse_updates),
         "skipped_params": 0,
-        "total_params": 0,
         "updated_params": 0,
-        "communication_bytes": 0,
-        "quantization_error": 0.0
+        "total_params": sum(p.numel() for p in global_model.parameters()),
+        "communication_bytes": model_size_bytes * len(sparse_updates),  # Initialize with download cost
+        "layer_communication": {},
+        "quantization_error": 0.0,
+        "dense_updates": 0,
+        "sparse_updates": 0,
+        "model_size_bytes": model_size_bytes,
+        "download_bytes": model_size_bytes * len(sparse_updates),  # Total download for all clients
+        "upload_bytes": 0  # Will accumulate upload bytes
     }
+    
+    # Get client weights
+    dataset_sizes = kwargs.get("dataset_sizes", [1.0] * len(sparse_updates))
+    total_size = sum(dataset_sizes)
+    client_weights = [size / total_size for size in dataset_sizes]
     
     print("\n[Server Debug] Starting aggregation of client updates...")
     
-    for client_idx, sparse_dict in enumerate(sparse_updates):
-        if dataset_sizes[client_idx] == 0:
-            print(f"[Server Debug] Warning: Client {client_idx} has 0 samples, skipping")
-            continue
-            
-        weight = dataset_sizes[client_idx] / total_samples
-        print(f"\n[Server Debug] Processing client {client_idx} (weight: {weight:.4f})")
-        
-        for param_name, update in sparse_dict.items():
-            if param_name not in updated_state:
-                print(f"[Server Debug] Skipping unknown parameter: {param_name}")
+    for client_idx, (update, client_weight) in enumerate(zip(sparse_updates, client_weights)):
+        for param_name, param in global_model.named_parameters():
+            if param_name not in update:
                 stats["skipped_params"] += 1
                 continue
-            
+                
             try:
-                indices, values = update
-                stats["total_params"] += 1
-                
-                # Skip empty updates
-                if isinstance(indices, torch.Tensor) and indices.numel() == 0:
-                    print(f"[Server Debug] Empty update for parameter: {param_name}")
-                    continue
-                elif isinstance(indices, tuple) and all(idx.numel() == 0 for idx in indices):
-                    print(f"[Server Debug] Empty update for parameter: {param_name}")
-                    continue
-                
-                param = updated_state[param_name]
-                flat_param = param.view(-1)
-                
-                # Handle tuple indices
-                if isinstance(indices, tuple):
-                    if len(indices) != 2:
-                        print(f"[Server Debug] Invalid tuple indices length for parameter: {param_name}")
-                        continue
-                    batch_idx, param_idx = indices
-                    if batch_idx.numel() == 0 or param_idx.numel() == 0:
-                        print(f"[Server Debug] Empty tuple indices for parameter: {param_name}")
-                        continue
-                    # Convert tuple indices to flat indices
-                    indices = param_idx.to(flat_param.device).to(torch.int64)
-                else:
-                    # Ensure indices and values are on the correct device and have correct types
-                    indices = indices.to(flat_param.device).to(torch.int64)
-                
-                values = values.to(flat_param.device).to(torch.float32)
-                
-                # Skip if indices are invalid
-                if indices.numel() > 0 and indices.max() >= flat_param.numel():
-                    print(f"[Server Debug] Invalid indices for parameter: {param_name}")
+                update_data = update[param_name]
+                if not isinstance(update_data, tuple):
+                    # Handle dense update
+                    if isinstance(update_data, torch.Tensor):
+                        param.data += update_data * client_weight
+                        stats["dense_updates"] += 1
+                        layer_comm = param.numel() * 4
+                        stats["communication_bytes"] += layer_comm
+                        stats["upload_bytes"] += layer_comm
+                        if param_name not in stats["layer_communication"]:
+                            stats["layer_communication"][param_name] = 0
+                        stats["layer_communication"][param_name] += layer_comm
                     continue
                 
-                # Handle scale factor for quantization
-                scale_factor = getattr(update, 'scale_factor', 1.0)
-                if scale_factor == 0:
-                    print(f"[Server Debug] Warning: Scale factor is 0 for parameter: {param_name}, using 1.0")
-                    scale_factor = 1.0
-                dequantized_values = values / scale_factor
-                
-                # Ensure shapes match before adding
-                if indices.numel() > 0 and indices.shape[0] != dequantized_values.shape[0]:
-                    print(f"[Server Debug] Shape mismatch for parameter: {param_name}")
+                indices, values = update_data
+                if not isinstance(indices, torch.Tensor) or not isinstance(values, torch.Tensor):
                     continue
+                    
+                flat_param = param.data.view(-1)
+                
+                # Calculate communication cost using same method as client
+                max_index = param.numel() - 1
+                if max_index <= 255:  # uint8
+                    index_bytes = 1
+                elif max_index <= 65535:  # uint16
+                    index_bytes = 2
+                else:  # uint32
+                    index_bytes = 4
+                
+                # Only count significant updates
+                mask = values.abs() > 1e-4  # Match client threshold
+                indices = indices[mask]
+                values = values[mask]
+                
+                if indices.numel() == 0:
+                    continue
+                
+                # Calculate bytes needed for this layer's update
+                indices_bytes = indices.numel() * index_bytes
+                values_bytes = values.numel() * 4  # float32 = 4 bytes
+                format_overhead = 3  # Match client overhead
+                
+                # Calculate total bytes for this layer
+                layer_comm = indices_bytes + values_bytes + format_overhead
+                
+                # Only use sparse if it's more efficient than dense
+                dense_layer_bytes = param.numel() * 4
+                if layer_comm >= dense_layer_bytes:
+                    # Fall back to dense format
+                    layer_comm = dense_layer_bytes
+                    update_data = (None, param.data.cpu())
                 
                 # Add the weighted update
                 if indices.numel() > 0:
-                    flat_param.index_add_(0, indices, weight * dequantized_values)
+                    flat_param.index_add_(0, indices, client_weight * values)
                     updated_state[param_name] = flat_param.view_as(param)
                     stats["updated_params"] += 1
+                    stats["communication_bytes"] += layer_comm
+                    stats["upload_bytes"] += layer_comm
+                    stats["sparse_updates"] += 1
                     
-                    # Update communication statistics
-                    indices_bytes = indices.numel() * indices.element_size()
-                    values_bytes = values.numel() * values.element_size()
-                    stats["communication_bytes"] += indices_bytes + values_bytes
-                    
-                    if hasattr(update, 'quantization_error'):
-                        stats["quantization_error"] += update.quantization_error
+                    # Track per-layer communication
+                    if param_name not in stats["layer_communication"]:
+                        stats["layer_communication"][param_name] = 0
+                    stats["layer_communication"][param_name] += layer_comm
                 
             except Exception as e:
                 print(f"[Server Debug] Error processing parameter {param_name}: {str(e)}")
@@ -114,46 +118,53 @@ def sparse_fedavg_aggregate(sparse_updates, global_model, model_name, tinyprop_p
     print(f"Total clients processed: {stats['total_updates']}")
     print(f"Parameters skipped: {stats['skipped_params']}")
     print(f"Parameters updated: {stats['updated_params']}/{stats['total_params']}")
-    print(f"Total communication: {stats['communication_bytes']/1024:.1f}KB")
-    print(f"Average quantization error: {stats['quantization_error']:.6f}")
+    print(f"Dense updates: {stats['dense_updates']}")
+    print(f"Sparse updates: {stats['sparse_updates']}")
+    print(f"Model size: {stats['model_size_bytes']/1024:.2f}KB")
+    print(f"Total download: {stats['download_bytes']/1024:.2f}KB")
+    print(f"Total upload: {stats['upload_bytes']/1024:.2f}KB")
+    print(f"Total communication: {stats['communication_bytes']/1024:.2f}KB")
+    print("\nPer-layer communication:")
+    for layer, comm in stats["layer_communication"].items():
+        print(f"  {layer}: {comm/1024:.2f}KB")
     
     global_model.load_state_dict(updated_state)
-    return global_model
+    return global_model, stats
 
-def standard_fedavg_aggregate(client_deltas, global_model, model_name, tinyprop_params, **kwargs):
-    """Standard FedAvg aggregation for dense models."""
-    # Get dataset sizes for weighted averaging
-    dataset_sizes = kwargs.get("dataset_sizes", None)
-    if dataset_sizes is None:
-        # If no dataset sizes provided, use equal weights
-        weights = [1.0 / len(client_deltas)] * len(client_deltas)
-    else:
-        total_size = sum(dataset_sizes)
-        weights = [size / total_size for size in dataset_sizes]
 
-    # Initialize aggregated parameters
-    aggregated_params = {}
-    for name, param in global_model.state_dict().items():
-        if param.requires_grad:
-            aggregated_params[name] = torch.zeros_like(param)
 
-    # Aggregate updates from all clients
-    for client_idx, deltas in enumerate(client_deltas):
-        weight = weights[client_idx]
-        for name, param in global_model.state_dict().items():
-            if param.requires_grad and name in deltas:
-                if isinstance(deltas[name], tuple):
-                    indices, values = deltas[name]
-                    if isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
-                        param.view(-1)[indices] += values * weight
-                else:
-                    aggregated_params[name] += deltas[name] * weight
+def standard_fedavg_aggregate(client_params, global_model, dataset_sizes=None, **kwargs):
+    """Aggregate dense updates from clients using standard FedAvg."""
+    print("\n[Server Debug] Starting dense aggregation...")
 
-    # Update global model
-    state_dict = global_model.state_dict()
-    for name, param in state_dict.items():
-        if param.requires_grad:
-            state_dict[name] = aggregated_params[name]
-    global_model.load_state_dict(state_dict)
+    global_state = global_model.state_dict()
+    tensor_keys = [k for k, v in global_state.items() if isinstance(v, torch.Tensor)]
+    
+    # Initialize parameter accumulator and stats
+    aggregated = {k: torch.zeros_like(global_state[k]) for k in tensor_keys}
+    stats = {
+        "total_updates": len(client_params),
+        "communication_bytes": sum(p.numel() * 4 for p in global_model.parameters()),  # 4 bytes per parameter
+        "layer_communication": {},
+        "updated_params": sum(p.numel() for p in global_model.parameters()),
+        "skipped_params": 0
+    }
+    
+    total_samples = sum(dataset_sizes) if dataset_sizes else len(client_params)
+    
+    for client_idx, params in enumerate(client_params):
+        weight = dataset_sizes[client_idx] / total_samples if dataset_sizes else 1.0 / len(client_params)
+        
+        for k, param_arr in zip(tensor_keys, params):
+            param_tensor = torch.from_numpy(param_arr).to(aggregated[k].device)
+            aggregated[k] += param_tensor * weight
 
-    return global_model
+    # Load aggregated parameters back into model
+    new_state = global_model.state_dict()
+    for k in tensor_keys:
+        new_state[k] = aggregated[k]
+    global_model.load_state_dict(new_state, strict=False)
+
+    return global_model, stats
+
+

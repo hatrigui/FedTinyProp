@@ -14,6 +14,8 @@ from models.tinyProp import get_phi_k
 import numpy as np
 import random
 import os
+import pandas as pd
+from datetime import datetime
 
 def evaluate_model(model, data_loader):
     """Evaluate model accuracy on a given data loader."""
@@ -67,23 +69,32 @@ def federated_training(
     if aggregator_kwargs is None:
         aggregator_kwargs = {}
 
-    if "dataset_sizes" not in aggregator_kwargs:
-        aggregator_kwargs["dataset_sizes"] = [len(ds) for ds in client_datasets]
-
     metrics_log = {
-        "accuracy": [], "flops": [], "memory": [], "memory_saved": [], "communication": [], "sparsity": [],
-        "avg_grad_norm": [], "phi_k": [], "skipped_batches": [],
-        "effective_compute_ratio": [], "compression_ratio": [], "client_eval_history": [],
-        "avg_phi_k": [], "avg_loss_change": [], "loss_threshold": [], "skipped_ratio": [],
-        "quantization_errors": [], "avg_scale_factors": []
+        "timestamp": [],
+        "round": [],
+        "accuracy": [],
+        "flops": [],
+        "memory": [],
+        "memory_saved": [],
+        "communication": [],
+        "sparsity": [],
+        "skipped_batches": [],
+        "effective_compute_ratio": [],
+        "compression_ratio": [],
+        "download_bytes": [],
+        "upload_bytes": [],
+        "model_size_bytes": [],
+        "communication_KB": [],
+        "communication_MB": [],
+        "download_KB": [],
+        "upload_KB": [],
+        "model_size_KB": [],
+        "client_eval_history": []
     }
 
     # Use dense config if specified
     if use_dense_baseline:
-        config = get_dense_config(model_name)
-        tinyprop_params = config["tinyprop_params"]
-        # Use standard FedAvg for dense baseline
-        aggregator_fn = standard_fedavg_aggregate
+        tinyprop_params = get_dense_config(model_name)["tinyprop_params"]
     else:
         config = get_tinyprop_config(model_name)
 
@@ -193,8 +204,6 @@ def federated_training(
             metrics_log["memory_saved"].append(sum(client.last_mem_saved for client in clients) / len(clients))
             metrics_log["communication"].append(sum(client.last_comm for client in clients) / len(clients))
             metrics_log["sparsity"].append(sum(client.last_sparsity for client in clients) / len(clients))
-            metrics_log["avg_grad_norm"].append(sum(client.last_avg_grad_norm for client in clients) / len(clients))
-            metrics_log["phi_k"].append(sum(client.last_phi for client in clients) / len(clients))
             metrics_log["skipped_batches"].append(sum(client.num_skipped_batches for client in clients))
             metrics_log["effective_compute_ratio"].append(1 - sum(client.num_skipped_batches for client in clients) / sum(len(client.train_loader) for client in clients))
             metrics_log["compression_ratio"].append(sum(client.compression_ratio for client in clients) / len(clients))
@@ -215,18 +224,19 @@ def federated_training(
             
             client_deltas = []
         
-        # Save metrics
-        if save_dir and save_interval > 0 and round_num % save_interval == 0:
-            save_training_logs_csv(
-                os.path.join(save_dir, f"{partition_type}_{model_name}_training_logs.csv"),
-                metrics_log["accuracy"],
-                metrics_log["flops"],
-                metrics_log["memory"],
-                metrics_log["communication"],
-                metrics_log["sparsity"],
-                quantization_errors,
-                memory_saved=metrics_log["memory_saved"]
-            )
+            # Save metrics
+            if save_dir and save_interval > 0 and round_num % save_interval == 0:
+                # Save training logs after metrics_log["communication"] is updated
+                save_training_logs_csv(
+                    os.path.join(save_dir, f"{partition_type}_{model_name}_training_logs.csv"),
+                    metrics_log["accuracy"],
+                    metrics_log["flops"],
+                    metrics_log["memory"],
+                    metrics_log["communication"],
+                    metrics_log["sparsity"],
+                    quantization_errors,
+                    memory_saved=metrics_log["memory_saved"]
+                )
 
         return (
             global_model,
@@ -236,8 +246,6 @@ def federated_training(
             metrics_log["memory_saved"],
             metrics_log["communication"],
             metrics_log["sparsity"],
-            metrics_log["avg_grad_norm"],
-            metrics_log["phi_k"],
             metrics_log["skipped_batches"],
             metrics_log["effective_compute_ratio"],
             metrics_log["client_eval_history"],
@@ -272,138 +280,158 @@ def federated_training(
     quantization_errors = []
     avg_scale_factors = []
 
+    # Initialize consolidated metrics with timestamp
+    consolidated_metrics = {
+        "timestamp": [],
+        "round": [],
+        "accuracy": [],
+        "flops": [],
+        "memory": [],
+        "memory_saved": [],
+        "communication": [],
+        "sparsity": [],
+        "skipped_batches": [],
+        "effective_compute_ratio": [],
+        "compression_ratio": [],
+        "download_bytes": [],
+        "upload_bytes": [],
+        "model_size_bytes": [],
+        "quantization_error": [],
+        "avg_scale_factor": []
+    }
+
     for rnd in range(rounds):
         print(f"\nRound {rnd+1}/{rounds}")
         global_params = global_model.state_dict()
         client_deltas = []
         stats = {
-            "flops": 0.0, "memory": 0.0, "memory_saved": 0.0, "communication": 0.0, "sparsity": 0.0,
-            "grad_norm": 0.0, "phi_k": 0.0, "skipped": 0, "nonzero": 0, "total": 0,
+            "flops": 0.0, "memory": 0.0, "memory_saved": 0.0, 
+            "communication": 0.0, "sparsity": 0.0,
+            "skipped": 0, 
+            "nonzero": 0, "total": 0,
             "effective_compute_ratio": 0.0,
-            "avg_phi_k": 0.0,
             "avg_loss_change": 0.0,
             "loss_threshold": 0.0,
             "skipped_ratio_sum": 0.0,
-            "layer_flops": {}
+            "layer_flops": {},
+            "layer_communication": {}
         }
 
-        # Set current round for all clients and adjust thresholds
+        # Set current round for all clients
         for client in clients:
             client.model.current_round = rnd
-            client.model.tpLayer.adjust_loss_threshold(rnd, rounds)
-            # Reset batch statistics for new round
-            client.model.tpLayer.reset_batch_stats()
+            if not use_dense_baseline:
+                client.model.tpLayer.adjust_loss_threshold(rnd, rounds)
+                client.model.tpLayer.reset_batch_stats()
 
+        # Client training phase
         for client_idx, client in enumerate(clients):
             parameters, num_examples, metrics = client.fit(
                 [val.cpu().numpy() for val in global_params.values()],
                 config={"local_epochs": local_epochs}
             )
-
-            print(f"[DEBUG] phi_k_history for client {client_idx}: {client.model.tpLayer.stats.get('phi_k_history')}")
+            
             client_deltas.append(client.weight_deltas)
-
-            # Update statistics
+            
+            # Update statistics from client metrics
             stats["flops"] += client.last_flops
             stats["memory"] = max(stats["memory"], client.last_mem)
             stats["memory_saved"] += client.last_mem_saved
+            stats["communication"] += client.last_comm
+            stats["sparsity"] += client.last_sparsity
+            stats["skipped"] += client.num_skipped_batches
             
-            # Track layer-wise FLOPs
-            if not hasattr(stats, "layer_flops"):
-                stats["layer_flops"] = {}
+            # Track layer-wise metrics
             client_metrics = client.compute_metrics()
-            for layer_name, layer_flops in client_metrics["layer_flops"].items():
+            for layer_name, layer_flops in client_metrics.get("layer_flops", {}).items():
                 if layer_name not in stats["layer_flops"]:
                     stats["layer_flops"][layer_name] = 0
                 stats["layer_flops"][layer_name] += layer_flops
             
-            # Communication tracking
-            comm_cost = 0.0
-            layer_comm = {}
-            for name, (indices, values) in client.weight_deltas.items():
-                if isinstance(indices, tuple) and isinstance(values, torch.Tensor):
-                    # Handle tuple indices (for multi-dimensional tensors)
-                    total_indices = sum(idx.numel() for idx in indices)
-                    total_values = values.numel()
-                    layer_comm[name] = (total_indices + total_values) * 2 * 0.8
-                    comm_cost += layer_comm[name]
-                elif isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
-                    # Handle single-dimensional tensors
-                    indices = indices.to(torch.int32)
-                    values = values.to(torch.float32)
-                    layer_comm[name] = (indices.numel() + values.numel()) * 2 * 0.8
-                    comm_cost += layer_comm[name]
-            stats["communication"] += comm_cost
-            stats["layer_communication"] = layer_comm
-            
-            # Update phi_k and skipping statistics
-            stats["phi_k"] += get_phi_k(client.model)
-            stats["skipped"] += client.model.tpLayer.stats["skipped_batches"]
-            total_batches = len(client.train_loader)
-            stats["effective_compute_ratio"] += 1 - (client.model.tpLayer.stats["skipped_batches"] / total_batches)
-            
-            # Track per-client skipped ratio with safety check
-            total_batches = max(len(client.train_loader), 1)  # Ensure non-zero denominator
-            skipped_ratio = client.model.tpLayer.stats.get("skipped_batches", 0) / total_batches
-            stats["skipped_ratio_sum"] += skipped_ratio
-            
-            # Track batch-level metrics with safety checks
-            if client.model.tpLayer.stats.get("phi_k_history"):
-                phi_history = client.model.tpLayer.stats["phi_k_history"]
-                stats["avg_phi_k"] += sum(phi_history) / max(len(phi_history), 1)
-                
-                loss_change_history = client.model.tpLayer.stats.get("loss_change_history", [])
-                if loss_change_history:
-                    stats["avg_loss_change"] += sum(loss_change_history) / max(len(loss_change_history), 1)
-                
-                stats["loss_threshold"] += client.model.tpLayer.stats.get("loss_threshold", 0.0)
-            
-            stats["sparsity"] += client.last_sparsity
-            stats["grad_norm"] += client.last_avg_grad_norm
-            
-            for name, (indices, values) in client.weight_deltas.items():
-                if isinstance(indices, torch.Tensor):
-                    stats["nonzero"] += indices.numel()
-            stats["total"] += sum(p.numel() for p in client.model.parameters())
+            for layer_name, layer_comm in client_metrics.get("layer_communication", {}).items():
+                if layer_name not in stats["layer_communication"]:
+                    stats["layer_communication"][layer_name] = 0
+                stats["layer_communication"][layer_name] += layer_comm
 
         # Average the statistics across clients
         num_clients = len(clients)
-        if num_clients > 0:  # Safety check
-            for key in ["phi_k", "grad_norm", "sparsity", "effective_compute_ratio", 
-                       "avg_phi_k", "avg_loss_change", "loss_threshold", "skipped_ratio_sum"]:
+        if num_clients > 0:
+            for key in ["flops", "memory_saved", "communication", "sparsity", 
+                       "effective_compute_ratio", "avg_loss_change", "loss_threshold", 
+                       "skipped_ratio_sum"]:
                 stats[key] /= num_clients
 
-        global_model = aggregator_fn(client_deltas, global_model, model_name, tinyprop_params, **aggregator_kwargs)
-
-        acc = sum(
-            client.local_evaluate(client.test_loader) for client in clients
-        ) / len(clients)
-        metrics_log["accuracy"].append(acc)
-        metrics_log["flops"].append(stats.get("flops", 0.0))
-        metrics_log["memory"].append(stats.get("memory", 0.0))
-        metrics_log["memory_saved"].append(stats.get("memory_saved", 0.0))
-        metrics_log["communication"].append(stats.get("communication", 0.0))
-        metrics_log["sparsity"].append(stats.get("sparsity", 0.0))
-        metrics_log["avg_grad_norm"].append(stats.get("grad_norm", 0.0))
-        metrics_log["phi_k"].append(stats.get("phi_k", 0.0))
-        metrics_log["skipped_batches"].append(stats.get("skipped", 0))
-        metrics_log["effective_compute_ratio"].append(stats.get("effective_compute_ratio", 0.0))
-        metrics_log["avg_phi_k"].append(stats.get("avg_phi_k", 0.0))
-        metrics_log["avg_loss_change"].append(stats.get("avg_loss_change", 0.0))
-        metrics_log["loss_threshold"].append(stats.get("loss_threshold", 0.0))
-        metrics_log["skipped_ratio"].append(stats.get("skipped_ratio_sum", 0.0))
-        metrics_log["compression_ratio"].append(
-            stats["nonzero"] / stats["total"] if stats["total"] > 0 else 0.0
+        # Server aggregation phase
+        global_model, agg_stats = aggregator_fn(
+            client_deltas, 
+            global_model, 
+            model_name, 
+            tinyprop_params, 
+            **{**aggregator_kwargs, "dataset_sizes": [len(c.train_loader.dataset) for c in clients]}
         )
-        metrics_log["client_eval_history"].append({cid: client.local_evaluate(client.test_loader) for cid, client in enumerate(clients)})
 
+        # Evaluate global model
+        acc = sum(client.local_evaluate(client.test_loader) for client in clients) / len(clients)
+        
+        # Update metrics log with consistent communication metrics
+        metrics_log["timestamp"].append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        metrics_log["round"].append(rnd + 1)
+        metrics_log["accuracy"].append(acc)
+        metrics_log["flops"].append(stats["flops"])
+        metrics_log["memory"].append(stats["memory"])
+        metrics_log["memory_saved"].append(stats["memory_saved"])
+        
+        # Get communication metrics from aggregator stats
+        if isinstance(agg_stats, dict):
+            total_comm = agg_stats["communication_bytes"]  # Total = download + upload
+            download_bytes = agg_stats["download_bytes"]   # Total download for all clients
+            upload_bytes = agg_stats["upload_bytes"]       # Total upload from all clients
+            model_size = agg_stats["model_size_bytes"]     # Size of model
+        else:
+            # Fallback to client stats if aggregator stats not available
+            total_comm = sum(client.last_comm for client in clients)
+            download_bytes = sum(client.communication_metrics['download_bytes'] for client in clients)
+            upload_bytes = sum(client.communication_metrics['upload_bytes'] for client in clients)
+            model_size = clients[0].communication_metrics['model_size_bytes']
+        
+        metrics_log["communication"].append(total_comm)
+        metrics_log["download_bytes"].append(download_bytes)
+        metrics_log["upload_bytes"].append(upload_bytes)
+        metrics_log["model_size_bytes"].append(model_size)
+        
+        # Calculate other metrics
+        total_batches = sum(len(client.train_loader) for client in clients)
+        total_skipped = sum(client.num_skipped_batches for client in clients)
+        effective_compute_ratio = 1.0 - (total_skipped / total_batches) if total_batches > 0 else 0.0
+        
+        metrics_log["sparsity"].append(stats["sparsity"])
+        metrics_log["skipped_batches"].append(total_skipped)
+        metrics_log["effective_compute_ratio"].append(effective_compute_ratio)
+        metrics_log["compression_ratio"].append(model_size / upload_bytes if upload_bytes > 0 else 1.0)
+        metrics_log["client_eval_history"].append(
+            {cid: client.local_evaluate(client.test_loader) for cid, client in enumerate(clients)}
+        )
+
+        # Save to single CSV file
         if csv_log_path:
-            append_to_training_log_csv(
-                csv_log_path, rnd + 1, acc, stats["flops"], stats["memory"], stats["communication"],
-                metrics_log["sparsity"][-1], metrics_log["avg_grad_norm"][-1], metrics_log["phi_k"][-1],
-                stats["skipped"], metrics_log["effective_compute_ratio"][-1], metrics_log["compression_ratio"][-1],
-                quantization_error=0.0, avg_scale_factor=1.0, memory_saved=stats["memory_saved"]
-            )
+            try:
+                # Create DataFrame from current metrics
+                df = pd.DataFrame({k: v for k, v in metrics_log.items() if len(v) > 0})
+                
+                # Verify all columns have the same length
+                lengths = {k: len(v) for k, v in df.items()}
+                if len(set(lengths.values())) != 1:
+                    print(f"[Warning] Inconsistent array lengths: {lengths}")
+                    # Find the minimum length
+                    min_length = min(lengths.values())
+                    # Truncate all arrays to the minimum length
+                    df = df.iloc[:min_length]
+                
+                df.to_csv(csv_log_path, index=False)
+                print(f"\n[INFO] Updated metrics saved to {csv_log_path}")
+            except Exception as e:
+                print(f"[Error] Failed to save metrics: {str(e)}")
+                print(f"Metrics lengths: {lengths}")
 
         if early_stopper and early_stopper.step(acc, rnd):
             print(f"\n[Early Stop] Triggered at round {rnd+1}!")
@@ -430,24 +458,46 @@ def federated_training(
         quantization_errors.append(avg_quantization_error)
         avg_scale_factors.append(avg_scale_factor)
 
-        # Save metrics
+        # Calculate effective compute ratio correctly
+        total_batches = sum(len(client.train_loader) for client in clients)
+        total_skipped = sum(client.num_skipped_batches for client in clients)
+        effective_compute_ratio = 1.0 - (total_skipped / total_batches) if total_batches > 0 else 0.0
+
+        # Calculate compression ratio correctly
+        total_original_size = sum(client.communication_metrics['model_size_bytes'] for client in clients)
+        total_compressed_size = sum(client.communication_metrics['upload_bytes'] for client in clients)
+        compression_ratio = total_original_size / total_compressed_size if total_compressed_size > 0 else 1.0
+
+        # Update consolidated metrics with current timestamp
+        current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        consolidated_metrics["timestamp"].append(current_timestamp)
+        consolidated_metrics["round"].append(rnd + 1)
+        consolidated_metrics["accuracy"].append(acc)
+        consolidated_metrics["flops"].append(stats["flops"])
+        consolidated_metrics["memory"].append(stats["memory"])
+        consolidated_metrics["memory_saved"].append(stats["memory_saved"])
+        consolidated_metrics["communication"].append(stats["communication"])
+        consolidated_metrics["sparsity"].append(stats["sparsity"])
+        consolidated_metrics["skipped_batches"].append(stats["skipped"])
+        consolidated_metrics["effective_compute_ratio"].append(effective_compute_ratio)
+        consolidated_metrics["compression_ratio"].append(compression_ratio)
+        consolidated_metrics["download_bytes"].append(sum(client.communication_metrics['download_bytes'] for client in clients) / len(clients))
+        consolidated_metrics["upload_bytes"].append(sum(client.communication_metrics['upload_bytes'] for client in clients) / len(clients))
+        consolidated_metrics["model_size_bytes"].append(sum(client.communication_metrics['model_size_bytes'] for client in clients) / len(clients))
+        consolidated_metrics["quantization_error"].append(avg_quantization_error)
+        consolidated_metrics["avg_scale_factor"].append(avg_scale_factor)
+
+        # Save consolidated metrics to a single CSV file
         if save_dir and save_interval > 0 and rnd % save_interval == 0:
-            # Save layer-wise FLOPs to a separate file
-            layer_flops_path = os.path.join(save_dir, f"{partition_type}_{model_name}_layer_flops.csv")
-            with open(layer_flops_path, 'a') as f:
-                if rnd == 0:
-                    f.write("round," + ",".join(stats["layer_flops"].keys()) + "\n")
-                f.write(f"{rnd}," + ",".join(str(flops) for flops in stats["layer_flops"].values()) + "\n")
-            
-            save_training_logs_csv(
-                os.path.join(save_dir, f"{partition_type}_{model_name}_training_logs.csv"),
-                metrics_log["accuracy"],
-                metrics_log["flops"],
-                metrics_log["memory"],
-                metrics_log["communication"],
-                metrics_log["sparsity"],
-                quantization_errors,
-                memory_saved=metrics_log["memory_saved"]
+            metrics_df = pd.DataFrame(consolidated_metrics)
+            # Ensure timestamp is the first column
+            cols = metrics_df.columns.tolist()
+            cols.remove('timestamp')
+            cols.insert(0, 'timestamp')
+            metrics_df = metrics_df[cols]
+            metrics_df.to_csv(
+                os.path.join(save_dir, f"{partition_type}_{model_name}_consolidated_metrics.csv"),
+                index=False
             )
 
         # Append detailed metrics
@@ -460,8 +510,6 @@ def federated_training(
             memory_saved=metrics_log["memory_saved"][-1],
             communication_bytes=metrics_log["communication"][-1],
             sparsity=metrics_log["sparsity"][-1],
-            avg_grad_norm=metrics_log["avg_grad_norm"][-1],
-            avg_phi=metrics_log["phi_k"][-1],
             skipped_batches=metrics_log["skipped_batches"][-1],
             effective_compute_ratio=metrics_log["effective_compute_ratio"][-1],
             compression_ratio=metrics_log["compression_ratio"][-1],
@@ -469,21 +517,79 @@ def federated_training(
             avg_scale_factor=avg_scale_factor
         )
 
+        # After aggregation, collect all metrics for this round
+        round_metrics = {
+            'round': rnd + 1,
+            'accuracy': float(acc),
+            'flops': float(stats["flops"]),
+            'memory': float(stats["memory"]),
+            'memory_saved': float(stats["memory_saved"]),
+            'communication': float(total_comm),
+            'sparsity': float(stats["sparsity"]),
+            'skipped_batches': int(total_skipped),
+            'effective_compute_ratio': float(effective_compute_ratio),
+            'compression_ratio': float(compression_ratio),
+            'download_bytes': float(model_size),
+            'upload_bytes': float(total_comm),
+            'model_size_bytes': float(model_size)
+        }
+
+        # Add human-readable metrics
+        round_metrics['communication_KB'] = round_metrics['communication'] / 1024
+        round_metrics['communication_MB'] = round_metrics['communication_KB'] / 1024
+        round_metrics['download_KB'] = round_metrics['download_bytes'] / 1024
+        round_metrics['upload_KB'] = round_metrics['upload_bytes'] / 1024
+        round_metrics['model_size_KB'] = round_metrics['model_size_bytes'] / 1024
+
+        # Append all metrics at once to ensure synchronization
+        for key in metrics_log.keys():
+            if key in round_metrics:
+                metrics_log[key].append(round_metrics[key])
+
+        # Save metrics to CSV after each round
+        if csv_log_path:
+            try:
+                # Create DataFrame from current metrics
+                df = pd.DataFrame({k: v for k, v in metrics_log.items() if len(v) > 0})
+                
+                # Verify all columns have the same length
+                lengths = {k: len(v) for k, v in df.items()}
+                if len(set(lengths.values())) != 1:
+                    print(f"[Warning] Inconsistent array lengths: {lengths}")
+                    # Find the minimum length
+                    min_length = min(lengths.values())
+                    # Truncate all arrays to the minimum length
+                    df = df.iloc[:min_length]
+                
+                df.to_csv(csv_log_path, index=False)
+                print(f"\n[INFO] Updated metrics saved to {csv_log_path}")
+            except Exception as e:
+                print(f"[Error] Failed to save metrics: {str(e)}")
+                print(f"Metrics lengths: {lengths}")
+
+        # Print round summary
+        print(f"\nRound {rnd + 1} Summary:")
+        print(f"Accuracy: {round_metrics['accuracy']:.4f}")
+        print(f"Communication: {round_metrics['communication_MB']:.2f}MB (Download: {round_metrics['download_KB']:.2f}KB, Upload: {round_metrics['upload_KB']:.2f}KB)")
+        print(f"Model Size: {round_metrics['model_size_KB']:.2f}KB")
+        print(f"Compression Ratio: {round_metrics['compression_ratio']:.2f}x")
+        print(f"Sparsity: {round_metrics['sparsity']:.2%}")
+        print(f"Skipped Batches: {round_metrics['skipped_batches']}")
+        print(f"Effective Compute Ratio: {round_metrics['effective_compute_ratio']:.4f}")
+
     return (
         global_model,
-        metrics_log["accuracy"],
-        metrics_log["flops"],
-        metrics_log["memory"],
-        metrics_log["memory_saved"],
-        metrics_log["communication"],
-        metrics_log["sparsity"],
-        metrics_log["avg_grad_norm"],
-        metrics_log["phi_k"],
-        metrics_log["skipped_batches"],
-        metrics_log["effective_compute_ratio"],
+        consolidated_metrics["accuracy"],
+        consolidated_metrics["flops"],
+        consolidated_metrics["memory"],
+        consolidated_metrics["memory_saved"],
+        consolidated_metrics["communication"],
+        consolidated_metrics["sparsity"],
+        consolidated_metrics["skipped_batches"],
+        consolidated_metrics["effective_compute_ratio"],
         metrics_log["client_eval_history"],
-        metrics_log["compression_ratio"],
-        metrics_log["quantization_errors"],
-        metrics_log["avg_scale_factors"],
+        consolidated_metrics["compression_ratio"],
+        consolidated_metrics["quantization_error"],
+        consolidated_metrics["avg_scale_factor"],
         history
     )

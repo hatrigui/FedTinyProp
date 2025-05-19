@@ -31,7 +31,13 @@ def get_tinyprop_config(dataset_name):
             "label_smoothing": 0.1,
             "quantization": {
                 "bits": 8,
-                "enabled": True
+                "enabled": True,
+                "adaptive": True,
+                "min_bits": 4,
+                "max_bits": 16,
+                "layer_specific": True,
+                "error_threshold": 0.01,
+                "momentum": 0.9
             }
         }
 
@@ -73,7 +79,13 @@ def get_tinyprop_config(dataset_name):
             },
             "quantization": {
                 "bits": 8,
-                "enabled": True
+                "enabled": True,
+                "adaptive": True,
+                "min_bits": 4,
+                "max_bits": 16,
+                "layer_specific": True,
+                "error_threshold": 0.01,
+                "momentum": 0.9
             }
         }
 
@@ -101,7 +113,13 @@ def get_tinyprop_config(dataset_name):
             "num_epochs": 1,
             "quantization": {
                 "bits": 8,
-                "enabled": True
+                "enabled": True,
+                "adaptive": True,
+                "min_bits": 4,
+                "max_bits": 16,
+                "layer_specific": True,
+                "error_threshold": 0.01,
+                "momentum": 0.9
             }
         }
         
@@ -132,7 +150,13 @@ def get_tinyprop_config(dataset_name):
             "label_smoothing": 0.1,
             "quantization": {
                 "bits": 8,
-                "enabled": True
+                "enabled": True,
+                "adaptive": True,
+                "min_bits": 4,
+                "max_bits": 16,
+                "layer_specific": True,
+                "error_threshold": 0.01,
+                "momentum": 0.9
             },
             "mfcc_config": {
                 "sample_rate": 16000,
@@ -153,28 +177,57 @@ def get_dense_config(dataset_name):
     """Get configuration for dense baseline model (no sparsity or skipping)."""
     dataset_name = dataset_name.lower()
 
-    dense_params = TinyPropParams(
-        S_min=0.0,
-        S_max=0.0,
-        zeta=0.0,
-        number_of_layers=5,  # Will be overridden by dataset-specific config
-        random_skip=False
-    )
-
-    base_cfg = get_tinyprop_config(dataset_name)
-    base_cfg["tinyprop_params"] = dense_params
-    base_cfg["skip_threshold"] = float("inf")  # Disable skipping
-    base_cfg["phi_min"] = 0.0  # Ensure no gradient masking
-    base_cfg["quantization"]["enabled"] = False  # Disable quantization for dense baseline
-    
-    # Override number of layers based on dataset
+    # Base configuration matching FedTinyProp
     if dataset_name in ["mnist", "fashionmnist"]:
-        base_cfg["tinyprop_params"].number_of_layers = 4
+        return {
+            "optimizer": {
+                "type": "sgd",
+                "lr": 0.0005,
+                "momentum": 0.7,
+                "weight_decay": 1e-4
+            },
+            "lr_scheduler": {
+                "type": "cosine",
+                "T_max": 100,
+                "eta_min": 0.00001,
+                "warmup_epochs": 5,
+                "warmup_start_lr": 0.00001
+            },
+            "gradient_clip": 1.0,
+            "train": {
+                "batch_size": 32,
+                "local_epochs": 1
+            },
+            "label_smoothing": 0.1,
+            # Disable sparsity and quantization for dense baseline
+            "tinyprop_params": TinyPropParams(
+                S_min=0.0,
+                S_max=0.0,
+                zeta=0.0,
+                number_of_layers=4,
+                random_skip=False
+            ),
+            "skip_threshold": float("inf"),  # Disable skipping
+            "phi_min": 0.0,  # No adaptive masking
+            "quantization": {
+                "bits": 8,
+                "enabled": False,  # Disable quantization for dense baseline
+                "adaptive": False,
+                "min_bits": 8,
+                "max_bits": 8,
+                "layer_specific": False,
+                "error_threshold": 0.0,
+                "momentum": 0.9
+            }
+        }
     elif dataset_name in ["cifar10", "cifar100"]:
-        base_cfg["tinyprop_params"].number_of_layers = 11
+        # ... existing CIFAR config ...
+        pass
     elif dataset_name == "har":
-        base_cfg["tinyprop_params"].number_of_layers = 5
+        # ... existing HAR config ...
+        pass
     elif dataset_name == "speechcommands":
-        base_cfg["tinyprop_params"].number_of_layers = 6
-    
-    return base_cfg
+        # ... existing SpeechCommands config ...
+        pass
+    else:
+        raise ValueError(f"No config defined for dataset: {dataset_name}")

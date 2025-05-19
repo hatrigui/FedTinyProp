@@ -38,6 +38,7 @@ class FederatedDenseClient(fl.client.NumPyClient):
         self.last_mem = 0.0
         self.last_comm = 0.0
         self.last_sparsity = 0.0
+        self.communication_metrics = {}
 
     def get_parameters(self):
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
@@ -60,6 +61,9 @@ class FederatedDenseClient(fl.client.NumPyClient):
             "phi": 1.0,
             "skipped_batches": 0,
             "sparsity": 0.0,
+            "flops": float(self.last_flops),
+            "memory_MB": float(self.last_mem),
+            "communication_bytes": float(self.last_comm),
         }
 
     def evaluate(self, parameters, config):
@@ -71,6 +75,10 @@ class FederatedDenseClient(fl.client.NumPyClient):
         total_loss, correct, total, total_flops = 0.0, 0, 0, 0.0
         sample_input, _ = next(iter(self.train_loader))
         layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
+        
+        # Store initial model size for communication tracking
+        model_size_bytes = sum(p.numel() * 4 for p in self.model.parameters())
+        
         for epoch in range(epochs):
             for x, y in self.train_loader:
                 x, y = x.to(self.device), y.to(self.device)
@@ -85,11 +93,41 @@ class FederatedDenseClient(fl.client.NumPyClient):
                 batch_flops, _ = compute_model_flops(self.model, x.shape, layer_sparsity)
                 total_flops += batch_flops
             if self.scheduler: self.scheduler.step()
+        
         self.last_flops = total_flops
         mem_report = estimate_model_memory(self.model, batch_size=sample_input.shape[0], input_shape=sample_input.shape[1:])
         self.last_mem = mem_report["total_MB"]
-        self.last_comm = sum(p.numel() * 4 for p in self.model.parameters())
+        
+        # Calculate communication costs:
+        # 1. Download: Full model weights (4 bytes per parameter)
+        # 2. Upload: Full model weights (4 bytes per parameter)
+        download_bytes = model_size_bytes
+        upload_bytes = model_size_bytes
+        self.last_comm = download_bytes + upload_bytes
+        
+        # Store detailed communication metrics
+        self.communication_metrics = {
+            'download_bytes': download_bytes,
+            'upload_bytes': upload_bytes,
+            'total_bytes': self.last_comm,
+            'compression_ratio': 1.0,  # No compression in dense case
+            'model_size_bytes': model_size_bytes
+        }
+        
         return total_loss / len(self.train_loader), 100.0 * correct / total
+
+    def get_metrics(self):
+        """Get detailed metrics including communication costs."""
+        return {
+            'flops': self.last_flops,
+            'memory': self.last_mem,
+            'communication': self.last_comm,
+            'sparsity': 0.0,  # No sparsity in dense case
+            'download_bytes': self.communication_metrics['download_bytes'],
+            'upload_bytes': self.communication_metrics['upload_bytes'],
+            'compression_ratio': 1.0,
+            'model_size_bytes': self.communication_metrics['model_size_bytes']
+        }
 
     def local_evaluate(self) -> float:
         self.model.eval()
