@@ -113,89 +113,45 @@ class TinyPropLayer:
         safe_Y_max = max(self.Y_max, 1e-8)
         return (min_retention + Y * (max_retention - min_retention) / safe_Y_max) * (params.zeta ** self.layerPosition)
 
-    def selectGradients(self, grad_output: torch.Tensor, params: TinyPropParams):
-        if grad_output.size(1) == 0:
-            return torch.empty((2, 0), dtype=torch.int64, device=grad_output.device), torch.empty((0,), dtype=grad_output.dtype, device=grad_output.device)
+    def selectGradients(self, grad, phi_k):
+        """Select gradients based on magnitude and apply quantization."""
+        # Ensure Y_max is never zero
+        max_Y = torch.max(torch.abs(grad))
+        self.Y_max = max(max_Y.item(), 1e-8)
         
-        ratio_from_client = getattr(self, 'adaptive_ratio', 1.0)
+        # Calculate adaptive sparsity based on current round
+        current_round = getattr(self, 'current_round', 0)
+        total_rounds = getattr(self, 'total_rounds', 100)
+        progress = current_round / total_rounds
         
-        # Compute gradient importance with better normalization
-        Y = grad_output.abs().sum(dim=1)
-        max_Y = torch.max(Y)
+        # Base sparsity increases with training progress
+        base_sparsity = 0.7 + 0.2 * progress  # Start at 70%, increase to 90%
         
-        # Only update Y_max if the new value is significant
-        if max_Y > 1e-8:
-            self.Y_max = max(max_Y.item(), 1e-8)  # Ensure Y_max never goes below 1e-8
+        # Effective sparsity combines base sparsity with phi_k
+        effective_sparsity = min(base_sparsity, phi_k)
         
-        # Ensure minimum gradient retention
-        bpr = self.BPR(params, Y)
-        bpr = bpr * ratio_from_client
-        bpr = torch.clamp(bpr, 0.1, 0.5)  # Force minimum 10% retention
+        # Calculate number of gradients to keep
+        K = int(grad.numel() * (1 - effective_sparsity))
+        K = max(K, int(grad.numel() * 0.1))  # Keep at least 10% of gradients
         
-        # Compute number of gradients to keep
-        K = torch.round(grad_output.size(1) * bpr)
-        K = K.clamp(min=1, max=grad_output.size(1))
-        
-        # Update statistics
-        self.miniBatchBpr += torch.mean(bpr).item()
-        self.miniBatchK += torch.mean(K.float()).item()
-        K = K.to(torch.int64)
-        
-        # Select gradients with top-k sparsity and quantization
-        idx_list = []
-        val_list = []
-        scale_list = []  # Store scale factors for each batch
-        for batch, k in enumerate(K):
-            grad = grad_output[batch].view(-1)
-            if grad.numel() == 0:
-                continue
+        # Select top-K gradients
+        if K > 0:
+            values, indices = torch.topk(torch.abs(grad).view(-1), K)
+            mask = torch.zeros_like(grad.view(-1))
+            mask[indices] = 1
+            mask = mask.view_as(grad)
             
-            k = min(k.item(), grad.numel())
-            if k == 0:
-                continue
+            # Apply mask to gradients
+            sparse_grad = grad * mask
             
-            try:
-                # Get top-k values and indices
-                values, indices = grad.abs().topk(k)
-                
-                # Apply quantization to the selected gradients
-                # Use 8-bit quantization (256 levels)
-                max_val = torch.max(torch.abs(values))
-                scale = 127.0 / max_val if max_val > 0 else 1.0
-                quantized_values = torch.round(values * scale)
-                
-                # Store scale factor for this batch
-                scale_list.append(scale)
-                
-                # Restore original signs
-                quantized_values = quantized_values * torch.sign(grad[indices])
-                
-                batch_idx = torch.full_like(indices, batch)
-                idx_list.append(torch.vstack((batch_idx, indices)))
-                val_list.append(quantized_values)
-                
-                # Track quantization error
-                if not hasattr(self, 'quantization_error'):
-                    self.quantization_error = []
-                dequantized_values = quantized_values / scale
-                error = torch.mean(torch.abs(values - dequantized_values))
-                self.quantization_error.append(error.item())
-                
-            except RuntimeError:
-                continue
-        
-        if not idx_list:
-            return torch.empty((2, 0), dtype=torch.long, device=grad_output.device), torch.empty((0,), dtype=grad_output.dtype, device=grad_output.device)
-        
-        indices_sparse = torch.hstack(idx_list)
-        values_sparse = torch.cat(val_list)
-        
-        # Store scale factors in stats
-        if not hasattr(self, 'stats'):
-            self.stats = {}
-        self.stats['scale_factors'] = scale_list
-        
-        return indices_sparse, values_sparse
+            # Quantize non-zero gradients
+            if self.quantization_bits > 0:
+                scale = self.Y_max / (2 ** (self.quantization_bits - 1) - 1)
+                sparse_grad = torch.round(sparse_grad / scale) * scale
+            
+            return sparse_grad
+        else:
+            return torch.zeros_like(grad)
 
     def update_phi(self, params, loss, batch_idx):
         """Update phi_k based on loss change and momentum."""
@@ -341,7 +297,7 @@ class TinyPropLayer:
             total_sparse_params = 0
             
             for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None:
+                if param.requires_grad:
                     # Calculate layer sparsity based on effective parameters
                     if self.current_round >= params.compression_warmup:
                         # Increase zeta over time
@@ -363,19 +319,27 @@ class TinyPropLayer:
                     num_keep = int(num_params * (1 - layer_sparsity))
                     
                     # Get top-k values and indices
-                    grad_flat = param.grad.data.view(-1)
-                    values, indices = torch.topk(torch.abs(grad_flat), k=num_keep)
+                    param_flat = param.data.view(-1)
+                    values, indices = torch.topk(torch.abs(param_flat), k=num_keep)
                     
-                    # Create sparse gradient
-                    sparse_grad = torch.zeros_like(grad_flat)
-                    sparse_grad[indices] = grad_flat[indices]
+                    # Create sparse parameter
+                    sparse_param = torch.zeros_like(param_flat)
+                    sparse_param[indices] = param_flat[indices]
                     
-                    # Update gradient
-                    param.grad.data = sparse_grad.view(param.grad.data.shape)
+                    # Update parameter
+                    param.data = sparse_param.view(param.data.shape)
                     
                     # Update compression statistics
                     total_params += num_params
                     total_sparse_params += num_keep
+                    
+                    # Also sparsify gradients if they exist
+                    if param.grad is not None:
+                        grad_flat = param.grad.data.view(-1)
+                        values, indices = torch.topk(torch.abs(grad_flat), k=num_keep)
+                        sparse_grad = torch.zeros_like(grad_flat)
+                        sparse_grad[indices] = grad_flat[indices]
+                        param.grad.data = sparse_grad.view(param.grad.data.shape)
             
             # Update compression ratio
             if total_params > 0:

@@ -94,181 +94,35 @@ def federated_training(
 
     # Use dense config if specified
     if use_dense_baseline:
-        tinyprop_params = get_dense_config(model_name)["tinyprop_params"]
+        config = get_dense_config(model_name)
+        tinyprop_params = config["tinyprop_params"]
     else:
         config = get_tinyprop_config(model_name)
-
-    global_model = get_tinyprop_model(model_name, tinyprop_params)
-
-    if num_clients is not None and num_rounds is not None and partition_type is not None and alpha is not None:
-        print(f"\n[Training Debug] Starting federated training with {num_clients} clients")
-        print(f"[Training Debug] Partition type: {partition_type}, alpha: {alpha}")
-        
-        global_model = get_tinyprop_model(model_name, config["tinyprop_params"])
-        global_params = global_model.state_dict()
-        clients = []
-        dataset_sizes = []
-        
-        print("\n[Training Debug] Initializing clients...")
-        for i in range(num_clients):
-            train_loader = DataLoader(client_datasets[i], batch_size=32, shuffle=True)
-            test_loader = DataLoader(testset, batch_size=32, shuffle=False)
-            dataset_sizes.append(len(train_loader.dataset))
-            
-            client = FederatedClient(
-                model=get_tinyprop_model(model_name, tinyprop_params),
-                train_loader=train_loader,
-                test_loader=test_loader,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                dataset_name="fashionmnist"
-            )
-            clients.append(client)
-            print(f"[Training Debug] Client {i} initialized with {dataset_sizes[i]} samples")
-        
-        client_deltas = []
-        quantization_errors = []
-        avg_scale_factors = []
-        for round_num in range(num_rounds):
-            print(f"\n[Training Debug] Starting round {round_num + 1}/{num_rounds}")
-            
-            for client_idx, client in enumerate(clients):
-                print(f"\n[Training Debug] Training client {client_idx}")
-                try:
-                    parameters, num_examples, metrics = client.fit(
-                        [val.cpu().numpy() for val in global_params.values()],
-                        config={"local_epochs": local_epochs}
-                    )
-                    
-                    print(f"\n[Training Debug] Client {client_idx} weight_deltas:")
-                    print(f"Keys: {list(client.weight_deltas.keys())}")
-                    for param_name, update in client.weight_deltas.items():
-                        print(f"\n[Training Debug] Processing {param_name}")
-                        print(f"Update type: {type(update)}")
-                        print(f"Update content: {update}")
-                        
-                        if not (isinstance(update, tuple) and len(update) == 2):
-                            print(f"[Training Debug][Client {client_idx}] Malformed update detected for param '{param_name}': {update}")
-                        elif not (isinstance(update[0], torch.Tensor) and isinstance(update[1], torch.Tensor)):
-                            print(f"[Training Debug][Client {client_idx}] Non-tensor update detected for param '{param_name}': {update}")
-                        else:
-                            indices, values = update
-                            print(f"[Training Debug][Client {client_idx}] Param '{param_name}' update shapes: indices={indices.shape}, values={values.shape}")
-                    
-                    client_deltas.append(client.weight_deltas)
-                    
-                except Exception as e:
-                    print(f"[Training Debug][Client {client_idx}] Error during training: {str(e)}")
-                    continue
-            
-            print("\n[Server Debug] Starting aggregation of client updates...")
-            total_updates = 0
-            total_skipped = 0
-            
-            for client_idx, deltas in enumerate(client_deltas):
-                client_weight = len(clients[client_idx].train_loader.dataset) / sum(len(c.train_loader.dataset) for c in clients)
-                print(f"\n[Server Debug] Processing client {client_idx} (weight: {client_weight:.4f})")
-                
-                for param_name, (indices, values) in deltas.items():
-                    if isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
-                        total_updates += 1
-                        param = global_model.state_dict()[param_name]
-                        if param.device != values.device:
-                            values = values.to(param.device)
-                            indices = indices.to(param.device)
-                        
-                        param.view(-1)[indices] += values * client_weight
-                    else:
-                        total_skipped += 1
-                        print(f"[Server Debug] Skipping malformed update for {param_name}")
-            
-            print("\n[Server Debug] Aggregation Statistics:")
-            print(f"Total clients processed: {len(client_deltas)}")
-            print(f"Parameters skipped: {total_skipped}")
-            print(f"Parameters updated: {total_updates}/{total_updates + total_skipped}")
-            
-            total_comm = 0
-            for deltas in client_deltas:
-                for name, (indices, values) in deltas.items():
-                    if isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
-                        total_comm += indices.numel() + values.numel()
-            print(f"Total communication: {total_comm * 4 / 1024:.2f}KB")  
-            
-            global_model.load_state_dict(global_params)
-            
-            acc = sum(client.local_evaluate(client.test_loader) for client in clients) / len(clients)
-            print(f"\n[Server Debug] Global model accuracy: {acc:.4f}")
-            
-            metrics_log["accuracy"].append(acc)
-            metrics_log["flops"].append(sum(client.last_flops for client in clients) / len(clients))
-            metrics_log["memory"].append(max(client.last_mem for client in clients))
-            metrics_log["memory_saved"].append(sum(client.last_mem_saved for client in clients) / len(clients))
-            metrics_log["communication"].append(sum(client.last_comm for client in clients) / len(clients))
-            metrics_log["sparsity"].append(sum(client.last_sparsity for client in clients) / len(clients))
-            metrics_log["skipped_batches"].append(sum(client.num_skipped_batches for client in clients))
-            metrics_log["effective_compute_ratio"].append(1 - sum(client.num_skipped_batches for client in clients) / sum(len(client.train_loader) for client in clients))
-            metrics_log["compression_ratio"].append(sum(client.compression_ratio for client in clients) / len(clients))
-            
-            
-            round_quantization_errors = []
-            round_scale_factors = []
-            for client in clients:
-                if hasattr(client, 'get_quantization_metrics'):
-                    error, scale = client.get_quantization_metrics()
-                    round_quantization_errors.append(error)
-                    round_scale_factors.append(scale)
-            
-            avg_quantization_error = np.mean(round_quantization_errors) if round_quantization_errors else 0.0
-            avg_scale_factor = np.mean(round_scale_factors) if round_scale_factors else 1.0
-            quantization_errors.append(avg_quantization_error)
-            avg_scale_factors.append(avg_scale_factor)
-            
-            client_deltas = []
-        
-            # Save metrics
-            if save_dir and save_interval > 0 and round_num % save_interval == 0:
-                # Save training logs after metrics_log["communication"] is updated
-                save_training_logs_csv(
-                    os.path.join(save_dir, f"{partition_type}_{model_name}_training_logs.csv"),
-                    metrics_log["accuracy"],
-                    metrics_log["flops"],
-                    metrics_log["memory"],
-                    metrics_log["communication"],
-                    metrics_log["sparsity"],
-                    quantization_errors,
-                    memory_saved=metrics_log["memory_saved"]
-                )
-
-        return (
-            global_model,
-            metrics_log["accuracy"],
-            metrics_log["flops"],
-            metrics_log["memory"],
-            metrics_log["memory_saved"],
-            metrics_log["communication"],
-            metrics_log["sparsity"],
-            metrics_log["skipped_batches"],
-            metrics_log["effective_compute_ratio"],
-            metrics_log["client_eval_history"],
-            metrics_log["compression_ratio"],
-            metrics_log["quantization_errors"],
-            metrics_log["avg_scale_factors"]
-        )
+        tinyprop_params = config["tinyprop_params"]
 
     global_model = get_tinyprop_model(model_name, tinyprop_params).to(device)
 
+    # Initialize clients
     clients = []
+    dataset_sizes = []
+    
+    print("\n[Training Debug] Initializing clients...")
     for i, dataset in enumerate(client_datasets):
-        client_model = get_tinyprop_model(model_name, tinyprop_params).to(device)
-        client_model.load_state_dict(global_model.state_dict())
-        clients.append(FederatedClient(
+        train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+        test_loader = DataLoader(testset, batch_size=32, shuffle=False)
+        dataset_sizes.append(len(train_loader.dataset))
+        
+        client = FederatedClient(
             client_id=i,
-            model=client_model,
-            train_loader=DataLoader(dataset, batch_size=32, shuffle=True),
-            test_loader=DataLoader(testset, batch_size=32, shuffle=False),
+            model=get_tinyprop_model(model_name, tinyprop_params).to(device),
+            train_loader=train_loader,
+            test_loader=test_loader,
             cfg=config,
             device=device,
             dataset_name=model_name
-        ))
+        )
+        clients.append(client)
+        print(f"[Training Debug] Client {i} initialized with {dataset_sizes[i]} samples")
 
     test_loader = DataLoader(testset, batch_size=32, shuffle=False)
 
@@ -326,49 +180,26 @@ def federated_training(
 
         # Client training phase
         for client_idx, client in enumerate(clients):
-            parameters, num_examples, metrics = client.fit(
-                [val.cpu().numpy() for val in global_params.values()],
-                config={"local_epochs": local_epochs}
-            )
-            
-            client_deltas.append(client.weight_deltas)
-            
-            # Update statistics from client metrics
-            stats["flops"] += client.last_flops
-            stats["memory"] = max(stats["memory"], client.last_mem)
-            stats["memory_saved"] += client.last_mem_saved
-            stats["communication"] += client.last_comm
-            stats["sparsity"] += client.last_sparsity
-            stats["skipped"] += client.num_skipped_batches
-            
-            # Track layer-wise metrics
-            client_metrics = client.compute_metrics()
-            for layer_name, layer_flops in client_metrics.get("layer_flops", {}).items():
-                if layer_name not in stats["layer_flops"]:
-                    stats["layer_flops"][layer_name] = 0
-                stats["layer_flops"][layer_name] += layer_flops
-            
-            for layer_name, layer_comm in client_metrics.get("layer_communication", {}).items():
-                if layer_name not in stats["layer_communication"]:
-                    stats["layer_communication"][layer_name] = 0
-                stats["layer_communication"][layer_name] += layer_comm
-
-        # Average the statistics across clients
-        num_clients = len(clients)
-        if num_clients > 0:
-            for key in ["flops", "memory_saved", "communication", "sparsity", 
-                       "effective_compute_ratio", "avg_loss_change", "loss_threshold", 
-                       "skipped_ratio_sum"]:
-                stats[key] /= num_clients
-
+            print(f"\n[Training Debug] Training client {client_idx}")
+            try:
+                parameters, num_examples, metrics = client.fit(
+                    [val.cpu().numpy() for val in global_params.values()],
+                    config={"local_epochs": local_epochs}
+                )
+                client_deltas.append(client.weight_deltas)
+            except Exception as e:
+                print(f"[Training Debug][Client {client_idx}] Error during training: {str(e)}")
+                continue
+        
         # Server aggregation phase
-        global_model, agg_stats = aggregator_fn(
-            client_deltas, 
-            global_model, 
-            model_name, 
-            tinyprop_params, 
-            **{**aggregator_kwargs, "dataset_sizes": [len(c.train_loader.dataset) for c in clients]}
-        )
+        if client_deltas:
+            global_model, agg_stats = aggregator_fn(
+                client_deltas,
+                global_model,
+                model_name,
+                tinyprop_params,
+                dataset_sizes=dataset_sizes
+            )
 
         # Evaluate global model
         acc = sum(client.local_evaluate(client.test_loader) for client in clients) / len(clients)
@@ -377,9 +208,9 @@ def federated_training(
         metrics_log["timestamp"].append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         metrics_log["round"].append(rnd + 1)
         metrics_log["accuracy"].append(acc)
-        metrics_log["flops"].append(stats["flops"])
-        metrics_log["memory"].append(stats["memory"])
-        metrics_log["memory_saved"].append(stats["memory_saved"])
+        metrics_log["flops"].append(sum(client.last_flops for client in clients) / len(clients))
+        metrics_log["memory"].append(max(client.last_mem for client in clients))
+        metrics_log["memory_saved"].append(sum(client.last_mem_saved for client in clients) / len(clients))
         
         # Get communication metrics from aggregator stats
         if isinstance(agg_stats, dict):
@@ -404,7 +235,7 @@ def federated_training(
         total_skipped = sum(client.num_skipped_batches for client in clients)
         effective_compute_ratio = 1.0 - (total_skipped / total_batches) if total_batches > 0 else 0.0
         
-        metrics_log["sparsity"].append(stats["sparsity"])
+        metrics_log["sparsity"].append(sum(client.last_sparsity for client in clients) / len(clients))
         metrics_log["skipped_batches"].append(total_skipped)
         metrics_log["effective_compute_ratio"].append(effective_compute_ratio)
         metrics_log["compression_ratio"].append(model_size / upload_bytes if upload_bytes > 0 else 1.0)
@@ -442,7 +273,7 @@ def federated_training(
         history["test_accuracy"].append(acc)
         history["sparsity"].append(metrics_log["sparsity"][-1])
         history["energy"].append(0.0)
-        history["communication"].append(stats["communication"])
+        history["communication"].append(total_comm)
 
         # Calculate quantization metrics
         round_quantization_errors = []
@@ -473,17 +304,17 @@ def federated_training(
         consolidated_metrics["timestamp"].append(current_timestamp)
         consolidated_metrics["round"].append(rnd + 1)
         consolidated_metrics["accuracy"].append(acc)
-        consolidated_metrics["flops"].append(stats["flops"])
-        consolidated_metrics["memory"].append(stats["memory"])
-        consolidated_metrics["memory_saved"].append(stats["memory_saved"])
-        consolidated_metrics["communication"].append(stats["communication"])
-        consolidated_metrics["sparsity"].append(stats["sparsity"])
-        consolidated_metrics["skipped_batches"].append(stats["skipped"])
+        consolidated_metrics["flops"].append(sum(client.last_flops for client in clients) / len(clients))
+        consolidated_metrics["memory"].append(max(client.last_mem for client in clients))
+        consolidated_metrics["memory_saved"].append(sum(client.last_mem_saved for client in clients) / len(clients))
+        consolidated_metrics["communication"].append(total_comm)
+        consolidated_metrics["sparsity"].append(sum(client.last_sparsity for client in clients) / len(clients))
+        consolidated_metrics["skipped_batches"].append(total_skipped)
         consolidated_metrics["effective_compute_ratio"].append(effective_compute_ratio)
         consolidated_metrics["compression_ratio"].append(compression_ratio)
-        consolidated_metrics["download_bytes"].append(sum(client.communication_metrics['download_bytes'] for client in clients) / len(clients))
-        consolidated_metrics["upload_bytes"].append(sum(client.communication_metrics['upload_bytes'] for client in clients) / len(clients))
-        consolidated_metrics["model_size_bytes"].append(sum(client.communication_metrics['model_size_bytes'] for client in clients) / len(clients))
+        consolidated_metrics["download_bytes"].append(download_bytes)
+        consolidated_metrics["upload_bytes"].append(upload_bytes)
+        consolidated_metrics["model_size_bytes"].append(model_size)
         consolidated_metrics["quantization_error"].append(avg_quantization_error)
         consolidated_metrics["avg_scale_factor"].append(avg_scale_factor)
 
@@ -521,16 +352,16 @@ def federated_training(
         round_metrics = {
             'round': rnd + 1,
             'accuracy': float(acc),
-            'flops': float(stats["flops"]),
-            'memory': float(stats["memory"]),
-            'memory_saved': float(stats["memory_saved"]),
+            'flops': float(sum(client.last_flops for client in clients) / len(clients)),
+            'memory': float(max(client.last_mem for client in clients)),
+            'memory_saved': float(sum(client.last_mem_saved for client in clients) / len(clients)),
             'communication': float(total_comm),
-            'sparsity': float(stats["sparsity"]),
+            'sparsity': float(sum(client.last_sparsity for client in clients) / len(clients)),
             'skipped_batches': int(total_skipped),
             'effective_compute_ratio': float(effective_compute_ratio),
             'compression_ratio': float(compression_ratio),
-            'download_bytes': float(model_size),
-            'upload_bytes': float(total_comm),
+            'download_bytes': float(download_bytes),
+            'upload_bytes': float(upload_bytes),
             'model_size_bytes': float(model_size)
         }
 

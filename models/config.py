@@ -100,17 +100,22 @@ def get_tinyprop_config(dataset_name):
             ),
             "optimizer": {
                 "type": "sgd",
-                "lr": 0.005,
-                "momentum": 0.9
+                "lr": 0.001,
+                "momentum": 0.9,
+                "weight_decay": 1e-4,
+                "nesterov": True
             },
             "lr_scheduler": {
                 "type": "cosine",
                 "T_max": 50,
-                "eta_min": 1e-5
+                "eta_min": 1e-5,
+                "warmup_epochs": 3,
+                "warmup_start_lr": 1e-5
             },
             "gradient_clip": 1.0,
             "batch_size": 32,
             "num_epochs": 1,
+            "label_smoothing": 0.1,
             "quantization": {
                 "bits": 8,
                 "enabled": True,
@@ -133,16 +138,17 @@ def get_tinyprop_config(dataset_name):
                 random_skip=False
             ),
             "optimizer": {
-                "type": "sgd",       # Adam is usually better for speech/MFCC
-                "lr": 0.001,
-                "weight_decay": 1e-4
+                "type": "sgd",
+                "lr": 0.005,         # Increased from 0.001 for better initial learning
+                "momentum": 0.9,      # Added momentum
+                "weight_decay": 5e-4  # Increased from 1e-4 for better regularization
             },
             "lr_scheduler": {
                 "type": "cosine",
-                "T_max": 50,
-                "eta_min": 1e-5,
-                "warmup_epochs": 3,
-                "warmup_start_lr": 1e-5
+                "T_max": 100,        # Increased from 50 for longer training
+                "eta_min": 1e-4,     # Increased from 1e-5
+                "warmup_epochs": 5,   # Increased from 3
+                "warmup_start_lr": 1e-4  # Increased from 1e-5
             },
             "gradient_clip": 1.0,
             "batch_size": 32,         # MFCC inputs are compact enough
@@ -221,13 +227,141 @@ def get_dense_config(dataset_name):
             }
         }
     elif dataset_name in ["cifar10", "cifar100"]:
-        # ... existing CIFAR config ...
-        pass
+        return {
+            "optimizer": {
+                "type": "sgd",
+                "lr": 0.01,
+                "momentum": 0.9,
+                "weight_decay": 5e-4
+            },
+            "lr_scheduler": {
+                "type": "cosine",
+                "T_max": 100,
+                "eta_min": 0.0001,
+                "warmup_epochs": 5,
+                "warmup_start_lr": 0.001
+            },
+            "gradient_clip": 1.0,
+            "train": {
+                "batch_size": 32,
+                "local_epochs": 1
+            },
+            "label_smoothing": 0.1,
+            "data_augmentation": {
+                "random_crop": True,
+                "random_horizontal_flip": True,
+                "random_rotation": 5,
+                "color_jitter": {
+                    "brightness": 0.2,
+                    "contrast": 0.2,
+                    "saturation": 0.2
+                }
+            },
+            # Disable sparsity and quantization for dense baseline
+            "tinyprop_params": TinyPropParams(
+                S_min=0.0,
+                S_max=0.0,
+                zeta=0.0,
+                number_of_layers=11,
+                random_skip=False
+            ),
+            "skip_threshold": float("inf"),  # Disable skipping
+            "phi_min": 0.0,  # No adaptive masking
+            "quantization": {
+                "bits": 8,
+                "enabled": False,  # Disable quantization for dense baseline
+                "adaptive": False,
+                "min_bits": 8,
+                "max_bits": 8,
+                "layer_specific": False,
+                "error_threshold": 0.0,
+                "momentum": 0.9
+            }
+        }
     elif dataset_name == "har":
-        # ... existing HAR config ...
-        pass
+        return {
+            "optimizer": {
+                "type": "sgd",
+                "lr": 0.005,
+                "momentum": 0.9
+            },
+            "lr_scheduler": {
+                "type": "cosine",
+                "T_max": 50,
+                "eta_min": 1e-5
+            },
+            "gradient_clip": 1.0,
+            "train": {
+                "batch_size": 32,
+                "local_epochs": 1
+            },
+            # Disable sparsity and quantization for dense baseline
+            "tinyprop_params": TinyPropParams(
+                S_min=0.0,
+                S_max=0.0,
+                zeta=0.0,
+                number_of_layers=5,
+                random_skip=False
+            ),
+            "skip_threshold": float("inf"),  # Disable skipping
+            "phi_min": 0.0,  # No adaptive masking
+            "quantization": {
+                "bits": 8,
+                "enabled": False,  # Disable quantization for dense baseline
+                "adaptive": False,
+                "min_bits": 8,
+                "max_bits": 8,
+                "layer_specific": False,
+                "error_threshold": 0.0,
+                "momentum": 0.9
+            }
+        }
     elif dataset_name == "speechcommands":
-        # ... existing SpeechCommands config ...
-        pass
+        return {
+            "optimizer": {
+                "type": "sgd",
+                "lr": 0.001,
+                "weight_decay": 1e-4
+            },
+            "lr_scheduler": {
+                "type": "cosine",
+                "T_max": 50,
+                "eta_min": 1e-5,
+                "warmup_epochs": 3,
+                "warmup_start_lr": 1e-5
+            },
+            "gradient_clip": 1.0,
+            "train": {
+                "batch_size": 32,
+                "local_epochs": 1
+            },
+            "label_smoothing": 0.1,
+            "mfcc_config": {
+                "sample_rate": 16000,
+                "n_mfcc": 40,
+                "n_fft": 1024,
+                "hop_length": 512
+            },
+            # Disable sparsity and quantization for dense baseline
+            "tinyprop_params": TinyPropParams(
+                S_min=0.0,
+                S_max=0.0,
+                zeta=0.0,
+                number_of_layers=6,
+                random_skip=False
+            ),
+            "skip_threshold": float("inf"),  # Disable skipping
+            "phi_min": 0.0,  # No adaptive masking
+            "quantization": {
+                "bits": 8,
+                "enabled": False,  # Disable quantization for dense baseline
+                "adaptive": False,
+                "min_bits": 8,
+                "max_bits": 8,
+                "layer_specific": False,
+                "error_threshold": 0.0,
+                "momentum": 0.9
+            }
+        }
     else:
         raise ValueError(f"No config defined for dataset: {dataset_name}")

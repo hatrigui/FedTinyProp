@@ -169,7 +169,18 @@ class FederatedClient(fl.client.NumPyClient):
         }
 
     def get_parameters(self):
-        return [val.cpu().numpy() for val in self.model.state_dict().values()]
+        """Get model parameters as a list of NumPy arrays."""
+        state_dict = self.model.state_dict()
+        parameters = []
+        for val in state_dict.values():
+            if isinstance(val, torch.Tensor):
+                # Convert to float32 before converting to numpy
+                if val.dtype == torch.long:
+                    val = val.float()
+                parameters.append(val.cpu().numpy())
+            else:
+                parameters.append(val)
+        return parameters
 
     def set_parameters(self, parameters):
         state_dict = self.model.state_dict()
@@ -295,159 +306,67 @@ class FederatedClient(fl.client.NumPyClient):
             self.metrics["effective_sparsity"].append(effective_sparsity)
 
     def compute_metrics(self) -> Dict[str, float]:
-        metrics = {
-            "flops": self.last_flops,
-            "memory": 0.0,
-            "memory_saved": 0.0,
-            "communication": 0.0,
-            "sparsity": 0.0,
-            "layer_flops": {},
-            "download_bytes": 0.0,
-            "upload_bytes": 0.0,
-            "compression_ratio": 1.0,
-            "model_size_bytes": 0.0
-        }
-
-        # Calculate model size and memory metrics
+        """Compute and return various metrics about the model and training."""
+        metrics = {}
+        
+        # Calculate model size and memory usage
         total_params = 0
-        total_nonzero = 0
+        nonzero_params = 0
         total_memory = 0
-        total_memory_saved = 0
+        sparse_memory = 0
         
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                param_size = param.numel()
-                total_params += param_size
+                # Count total parameters
+                total_params += param.numel()
                 
-                # Calculate memory for dense parameter (4 bytes per float32)
-                dense_memory = param_size * 4
-                total_memory += dense_memory
+                # Count nonzero parameters
+                nonzero_mask = param.data != 0
+                nonzero_count = nonzero_mask.sum().item()
+                nonzero_params += nonzero_count
                 
-                # Calculate memory for sparse parameter if applicable
-                if name in self.weight_deltas:
-                    update_data = self.weight_deltas[name]
-                    if isinstance(update_data, tuple):
-                        indices, values = update_data
-                        if isinstance(indices, torch.Tensor) and isinstance(values, torch.Tensor):
-                            # Calculate sparse memory (indices + values + overhead)
-                            max_index = param_size - 1
-                            if max_index <= 255:  # uint8
-                                index_bytes = 1
-                            elif max_index <= 65535:  # uint16
-                                index_bytes = 2
-                            else:  # uint32
-                                index_bytes = 4
-                            
-                            sparse_memory = (indices.numel() * index_bytes +  # indices
-                                           values.numel() * 4 +              # values (float32)
-                                           3)                               # format overhead
-                            
-                            # Only use sparse if it's more efficient
-                            if sparse_memory < dense_memory:
-                                total_memory_saved += (dense_memory - sparse_memory)
-                                total_nonzero += indices.numel()
-                            else:
-                                total_nonzero += param_size
-                        else:
-                            total_nonzero += param_size
-                    else:
-                        total_nonzero += param_size
-                else:
-                    total_nonzero += param_size
-
-        # Calculate model size for download cost (full model)
-        model_size_bytes = total_memory
-        metrics["model_size_bytes"] = model_size_bytes
-        metrics["download_bytes"] = model_size_bytes  # Each client downloads full model
-        metrics["memory"] = total_memory / (1024 * 1024)  # Convert to MB
-        metrics["memory_saved"] = total_memory_saved / (1024 * 1024)  # Convert to MB
-
-        # Calculate sparse upload cost with optimized format
-        upload_bytes = 0
-        layer_communications = {}
+                # Calculate memory usage
+                param_memory = param.numel() * 4  # 4 bytes per parameter (float32)
+                total_memory += param_memory
+                
+                # Calculate sparse memory (only nonzero parameters)
+                sparse_memory += nonzero_count * 4
         
-        # Higher threshold for significant updates
-        SIGNIFICANT_THRESHOLD = 1e-4  # Increased from 1e-6
+        # Calculate memory saved
+        self.last_mem = total_memory
+        self.last_mem_saved = max(0, total_memory - sparse_memory)
         
-        for name, update_data in self.weight_deltas.items():
-            if isinstance(update_data, tuple):
-                indices, values = update_data
-                if not isinstance(indices, torch.Tensor) or not isinstance(values, torch.Tensor):
-                    continue
-                    
-                param = self.model.state_dict()[name]
-                
-                # Only keep significant updates
-                mask = values.abs() > SIGNIFICANT_THRESHOLD
-                indices = indices[mask]
-                values = values[mask]
-                
-                if indices.numel() == 0:
-                    continue
-                
-                # Optimize index storage
-                max_index = param.numel() - 1
-                if max_index <= 255:  # Can use uint8
-                    indices = indices.to(torch.uint8)
-                    index_bytes = 1
-                elif max_index <= 65535:  # Can use uint16
-                    indices = indices.to(torch.uint16)
-                    index_bytes = 2
-                else:  # Must use uint32
-                    indices = indices.to(torch.uint32)
-                    index_bytes = 4
-                
-                # Calculate bytes needed for this layer's update
-                indices_bytes = indices.numel() * index_bytes
-                values_bytes = values.numel() * 4  # float32 = 4 bytes
-                format_overhead = 3  # Reduced format overhead
-                
-                # Calculate total bytes for this layer
-                layer_comm = indices_bytes + values_bytes + format_overhead
-                
-                # Only use sparse format if it's more efficient than dense
-                dense_layer_bytes = param.numel() * 4
-                if layer_comm >= dense_layer_bytes:
-                    # Fall back to dense format
-                    layer_comm = dense_layer_bytes
-                    self.weight_deltas[name] = (None, param.data.cpu())
-                
-                upload_bytes += layer_comm
-                layer_communications[name] = layer_comm
-            else:
-                # Handle dense update
-                param = self.model.state_dict()[name]
-                upload_bytes += param.numel() * 4
-                layer_communications[name] = param.numel() * 4
-
-        metrics["upload_bytes"] = upload_bytes
-        metrics["communication"] = upload_bytes + model_size_bytes  # Total = upload + download
-        metrics["layer_communication"] = layer_communications
+        # Calculate communication metrics
+        self.communication_metrics['model_size_bytes'] = total_memory
+        self.communication_metrics['download_bytes'] = total_memory  # Full model download
+        self.communication_metrics['upload_bytes'] = sparse_memory  # Only nonzero parameters
         
-        # Calculate effective compression ratio
-        if upload_bytes > 0:
-            metrics["compression_ratio"] = model_size_bytes / upload_bytes
+        # Calculate compression ratio
+        if sparse_memory > 0:
+            self.communication_metrics['compression_ratio'] = total_memory / sparse_memory
         else:
-            metrics["compression_ratio"] = 1.0
+            self.communication_metrics['compression_ratio'] = 1.0
             
-        # Calculate effective sparsity
-        if total_params > 0:
-            metrics["sparsity"] = 1.0 - (total_nonzero / total_params)
+        # Calculate total communication
+        self.last_comm = self.communication_metrics['download_bytes'] + self.communication_metrics['upload_bytes']
         
-        # Store metrics for logging
-        self.last_comm = metrics["communication"]
-        self.last_mem = metrics["memory"]
-        self.last_mem_saved = metrics["memory_saved"]
-        self.communication_metrics = {
-            'download_bytes': metrics["download_bytes"],
-            'upload_bytes': metrics["upload_bytes"],
-            'total_bytes': metrics["communication"],
-            'compression_ratio': metrics["compression_ratio"],
-            'model_size_bytes': metrics["model_size_bytes"],
-            'layer_communications': layer_communications
+        # Calculate sparsity
+        self.last_sparsity = 1.0 - (nonzero_params / total_params) if total_params > 0 else 0.0
+        
+        # Calculate FLOPs
+        self.last_flops = compute_model_flops(self.model)
+        
+        return {
+            'flops': self.last_flops,
+            'memory': self.last_mem,
+            'memory_saved': self.last_mem_saved,
+            'communication': self.last_comm,
+            'sparsity': self.last_sparsity,
+            'download_bytes': self.communication_metrics['download_bytes'],
+            'upload_bytes': self.communication_metrics['upload_bytes'],
+            'model_size_bytes': self.communication_metrics['model_size_bytes'],
+            'compression_ratio': self.communication_metrics['compression_ratio']
         }
-        
-        return metrics
 
     def get_quantization_metrics(self) -> Tuple[float, float]:
         """Return the current quantization error and average scale factor."""
@@ -581,27 +500,22 @@ class FederatedClient(fl.client.NumPyClient):
         self.model.tpLayer.adjust_loss_threshold(current_round, total_rounds)
         
         progress = current_round / total_rounds
-        # Make sparsity increase more aggressively by using a quadratic progression
         progressive_factor = 1.0 + (self.S_max - self.S_min) * (progress ** 2)
         
-        # Add early sparsity boost
-        if current_round < total_rounds * 0.3:  # First 30% of rounds
-            progressive_factor *= 1.5  # 50% boost in early rounds
+        if current_round < total_rounds * 0.3:
+            progressive_factor *= 1.5
 
         max_grad_norm = 1.0  
         grad_clip_threshold = 5.0
         
-        # Track loss history for zeta adjustment
         loss_history = []
         loss_window_size = 5
-        zeta_adjustment_threshold = 0.01  # Minimum loss change to trigger zeta adjustment
+        zeta_adjustment_threshold = 0.01
         
-        # Get initial memory estimate
         sample_input, _ = next(iter(self.train_loader))
         mem_report = estimate_model_memory(self.model, batch_size=sample_input.shape[0], input_shape=sample_input.shape[1:])
         total_memory = mem_report["total_MB"]
         
-        # Initialize layer sparsity for FLOPs calculation
         layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
         
         for epoch in range(num_epochs):
@@ -612,12 +526,10 @@ class FederatedClient(fl.client.NumPyClient):
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
                 
-                # Track loss history
                 loss_history.append(loss.item())
                 if len(loss_history) > loss_window_size:
                     loss_history.pop(0)
                 
-                # Adjust zeta based on loss plateauing
                 if len(loss_history) == loss_window_size:
                     loss_change = abs(loss_history[-1] - loss_history[0])
                     if loss_change < zeta_adjustment_threshold:
@@ -648,7 +560,6 @@ class FederatedClient(fl.client.NumPyClient):
                 if grad_norm > 0:
                     epoch_grad_norms.append(grad_norm)
                     
-                    # Skip batch skipping logic for dense baseline
                     if not self.is_dense_baseline:
                         self.model.tpLayer.update_phi(self.model.tpParams, loss.item(), batch_idx)
                         
@@ -656,9 +567,7 @@ class FederatedClient(fl.client.NumPyClient):
                             self.num_skipped_batches += 1
                             continue
                     
-                    # Calculate FLOPs only for non-skipped batches
                     if self.is_dense_baseline:
-                        # For dense baseline, use zero sparsity
                         layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
                     else:
                         if self.adaptive_sparsity:
@@ -667,13 +576,10 @@ class FederatedClient(fl.client.NumPyClient):
                             base_sparsity = self.S_min + (self.S_max - self.S_min) * (1 - phi)
                             local_sparsity = min(self.S_max, base_sparsity * progressive_factor)
                             epoch_effective_sparsities.append(local_sparsity)
-                            # Update layer sparsity for FLOPs calculation
                             layer_sparsity = {name: local_sparsity for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
                     
-                    # Calculate FLOPs for the current batch
                     batch_flops, _ = compute_model_flops(self.model, inputs.shape, layer_sparsity)
                     total_flops += batch_flops
-                    
 
                 self.optimizer.step()
                 
@@ -691,7 +597,11 @@ class FederatedClient(fl.client.NumPyClient):
         self.last_avg_grad_norm = np.mean(epoch_grad_norms) if epoch_grad_norms else 0.0
         self.last_phi = self.model.phi_k
         
+        # Calculate weight deltas and compression metrics
         self.weight_deltas = {}
+        total_dense_size = 0
+        total_sparse_size = 0
+        
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 initial = initial_weights[name]
@@ -699,8 +609,21 @@ class FederatedClient(fl.client.NumPyClient):
                 delta = final - initial
                 
                 if delta.numel() > 0:
-                    # Use higher threshold for significant updates
-                    mask = delta.abs() > 1e-4  # Increased from 1e-6
+                    # Calculate relative threshold based on layer's dynamic range
+                    max_abs_value = delta.abs().max().item()
+                    min_abs_value = delta[delta != 0].abs().min().item() if (delta != 0).any() else max_abs_value
+                    dynamic_range = max_abs_value - min_abs_value
+                    
+                    current_round = getattr(self.model, 'current_round', 0)
+                    total_rounds = self.cfg.get("total_rounds", 100)
+                    progress = current_round / total_rounds
+                    
+                    base_threshold = 1e-3 * (1 - 0.9 * progress)
+                    relative_threshold = base_threshold * max_abs_value
+                    min_threshold = dynamic_range * 1e-4
+                    threshold = max(relative_threshold, min_threshold)
+                    
+                    mask = delta.abs() > threshold
                     
                     if len(delta.shape) > 1:
                         flat_delta = delta.view(-1)
@@ -712,15 +635,35 @@ class FederatedClient(fl.client.NumPyClient):
                         values = delta[indices]
                     
                     if indices.numel() > 0:
-                        # Only store if sparse format would be more efficient
+                        # Calculate sizes
                         param_size = param.numel() * 4  # dense size in bytes
-                        sparse_size = (indices.numel() * (2 if param.numel() <= 65535 else 4) + 
-                                     values.numel() * 4 + 3)  # sparse size with overhead
+                        max_index = param.numel() - 1
+                        index_bytes = 1 if max_index <= 255 else (2 if max_index <= 65535 else 4)
+                        sparse_size = (indices.numel() * index_bytes + values.numel() * 4 + 3)  # sparse size with overhead
+                        
+                        total_dense_size += param_size
                         
                         if sparse_size < param_size:
+                            # Store as sparse update
                             self.weight_deltas[name] = (indices, values)
+                            total_sparse_size += sparse_size
                         else:
-                            self.weight_deltas[name] = (None, param.data.cpu())  # Store full parameter
+                            # Store as dense update
+                            self.weight_deltas[name] = (None, delta.cpu())
+                            total_sparse_size += param_size
+                    else:
+                        # No significant updates, store as dense update with zeros
+                        self.weight_deltas[name] = (None, torch.zeros_like(delta).cpu())
+                        total_sparse_size += param.numel() * 4
+        
+        # Update communication metrics
+        self.communication_metrics['model_size_bytes'] = total_dense_size
+        self.communication_metrics['download_bytes'] = total_dense_size
+        self.communication_metrics['upload_bytes'] = total_sparse_size
+        self.communication_metrics['compression_ratio'] = total_dense_size / total_sparse_size if total_sparse_size > 0 else 1.0
+        
+        # Calculate memory saved
+        self.last_mem_saved = max(0, total_dense_size - total_sparse_size)
         
         return total_loss / len(self.train_loader), 100. * correct / total
 

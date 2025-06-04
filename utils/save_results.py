@@ -37,7 +37,7 @@ def append_to_training_log_csv(filepath, round_num, accuracy, flops, memory_byte
                              sparsity, avg_grad_norm=None, avg_phi=None, skipped_batches=None, 
                              effective_compute_ratio=None, compression_ratio=None, quantization_error=None, 
                              avg_scale_factor=None, memory_saved=None, download_bytes=None, upload_bytes=None,
-                             model_size_bytes=None):
+                             model_size_bytes=None, proximal_loss=None):
     """Append a single round's metrics to the CSV file."""
     metrics = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -57,7 +57,8 @@ def append_to_training_log_csv(filepath, round_num, accuracy, flops, memory_byte
         "memory_saved": memory_saved if memory_saved is not None else 0.0,
         "download_bytes": download_bytes if download_bytes is not None else 0.0,
         "upload_bytes": upload_bytes if upload_bytes is not None else 0.0,
-        "model_size_bytes": model_size_bytes if model_size_bytes is not None else 0.0
+        "model_size_bytes": model_size_bytes if model_size_bytes is not None else 0.0,
+        "proximal_loss": proximal_loss if proximal_loss is not None else 0.0
     }
     
     # Add human-readable columns
