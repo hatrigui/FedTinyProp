@@ -8,7 +8,7 @@ from utils.early_stopping import EarlyStoppingMonitor
 from utils.save_results import append_to_training_log_csv, save_training_logs_csv
 from utils.adaptive_sparsification import AdaptiveSparsifier
 from models.model import get_tinyprop_model
-from clients.aggregators import sparse_fedavg_aggregate, standard_fedavg_aggregate
+from clients.aggregators import sparse_fedavg_aggregate
 from utils.adaptive_sparsification import AdaptiveSparsifier
 from models.tinyProp import get_phi_k
 import numpy as np
@@ -58,7 +58,11 @@ def federated_training(
     save_dir=None,
     save_interval=1,
     quantization_bits=8,
-    use_dense_baseline: bool = False
+    use_dense_baseline: bool = False,
+    use_fedprox: bool = False,
+    use_fedprune: bool = False,
+    fedprox_mu: float = 0.1,
+    fedprune_sparsity: float = 0.5,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -112,12 +116,25 @@ def federated_training(
         test_loader = DataLoader(testset, batch_size=32, shuffle=False)
         dataset_sizes.append(len(train_loader.dataset))
         
+        client_model = get_tinyprop_model(model_name, tinyprop_params).to(device)
+        
+        # Apply FedPrune static masks if enabled
+        if use_fedprune:
+            for param in client_model.parameters():
+                mask = (torch.rand_like(param) > fedprune_sparsity).float().to(device)
+                param.data.mul_(mask)
+                param.register_hook(lambda grad, mask=mask: grad.mul_(mask))
+        
+        client_cfg = config.copy()
+        client_cfg["use_fedprox"] = use_fedprox
+        client_cfg["fedprox_mu"] = fedprox_mu
+        
         client = FederatedClient(
             client_id=i,
-            model=get_tinyprop_model(model_name, tinyprop_params).to(device),
+            model=client_model,
             train_loader=train_loader,
             test_loader=test_loader,
-            cfg=config,
+            cfg=client_cfg,
             device=device,
             dataset_name=model_name
         )
@@ -151,7 +168,8 @@ def federated_training(
         "upload_bytes": [],
         "model_size_bytes": [],
         "quantization_error": [],
-        "avg_scale_factor": []
+        "avg_scale_factor": [],
+        "method": []
     }
 
     for rnd in range(rounds):
@@ -170,6 +188,15 @@ def federated_training(
             "layer_flops": {},
             "layer_communication": {}
         }
+
+        # Determine method type
+        method = "FedTinyProp"
+        if use_dense_baseline:
+            method = "Dense"
+        elif use_fedprox:
+            method = "FedProx"
+        elif use_fedprune:
+            method = "FedPrune"
 
         # Set current round for all clients
         for client in clients:
@@ -317,6 +344,7 @@ def federated_training(
         consolidated_metrics["model_size_bytes"].append(model_size)
         consolidated_metrics["quantization_error"].append(avg_quantization_error)
         consolidated_metrics["avg_scale_factor"].append(avg_scale_factor)
+        consolidated_metrics["method"].append(method)
 
         # Save consolidated metrics to a single CSV file
         if save_dir and save_interval > 0 and rnd % save_interval == 0:

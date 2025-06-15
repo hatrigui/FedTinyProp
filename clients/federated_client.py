@@ -36,6 +36,9 @@ class FederatedClient(fl.client.NumPyClient):
             self.cfg.get("skip_threshold", float("inf")) == float("inf")
         )
         
+        # Add FedPrune flag
+        self.is_fedprune = self.cfg.get("use_fedprune", False)
+        
         self.metrics = {
             'round': [],
             'loss': [],
@@ -211,7 +214,14 @@ class FederatedClient(fl.client.NumPyClient):
         batch_size = config.get("batch_size", 32) if config else 32
         local_epochs = config.get("local_epochs", 1) if config else 1
         
-        loss, accuracy = self.train(num_epochs=local_epochs, batch_size=batch_size)
+        # Convert parameters to global_params dict for FedProx
+        global_params = {name: torch.tensor(param) for name, param in zip(self.model.state_dict().keys(), parameters)}
+        
+        loss, accuracy = self.train(
+            num_epochs=local_epochs, 
+            batch_size=batch_size,
+            global_params=global_params if self.cfg.get("use_fedprox", False) else None
+        )
         updated_parameters = self.get_parameters()
         metrics = {
             "loss": float(loss),
@@ -263,14 +273,14 @@ class FederatedClient(fl.client.NumPyClient):
 
     def should_skip_update(self, current_grad_norm: float) -> bool:
         """Determine if the current update should be skipped based on gradient norm."""
-        if self.is_dense_baseline:
+        if self.is_dense_baseline or self.is_fedprune:
             return False
         return current_grad_norm < self.skip_threshold
 
     def apply_gradient_sparsification(self, phi: float) -> None:
         """Apply gradient sparsification with top-k selection."""
-        if self.is_dense_baseline:
-            return  # Skip sparsification for dense baseline
+        if self.is_dense_baseline or self.is_fedprune:
+            return  # Skip sparsification for dense baseline or FedPrune
             
         total_nonzero = 0
         total_elements = 0
@@ -315,6 +325,9 @@ class FederatedClient(fl.client.NumPyClient):
         total_memory = 0
         sparse_memory = 0
         
+        # Track layer-wise sparsity for FLOPs calculation
+        layer_sparsity = {}
+        
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 # Count total parameters
@@ -331,6 +344,10 @@ class FederatedClient(fl.client.NumPyClient):
                 
                 # Calculate sparse memory (only nonzero parameters)
                 sparse_memory += nonzero_count * 4
+                
+                # Store layer sparsity for FLOPs calculation
+                if len(param.shape) > 1:  # Only for weight matrices
+                    layer_sparsity[name] = 1.0 - (nonzero_count / param.numel())
         
         # Calculate memory saved
         self.last_mem = total_memory
@@ -353,8 +370,13 @@ class FederatedClient(fl.client.NumPyClient):
         # Calculate sparsity
         self.last_sparsity = 1.0 - (nonzero_params / total_params) if total_params > 0 else 0.0
         
-        # Calculate FLOPs
-        self.last_flops = compute_model_flops(self.model)
+        # Calculate FLOPs with proper sparsity consideration
+        if self.is_fedprune:
+            # For FedPrune, use the actual layer-wise sparsity from the masks
+            self.last_flops = compute_model_flops(self.model, layer_sparsity=layer_sparsity)
+        else:
+            # For other methods, use the existing FLOPs calculation
+            self.last_flops = compute_model_flops(self.model)
         
         return {
             'flops': self.last_flops,
@@ -477,7 +499,7 @@ class FederatedClient(fl.client.NumPyClient):
         
         return quantized, error, scale_factor
 
-    def train(self, num_epochs: int = 1, batch_size: int = 32) -> Tuple[float, float]:
+    def train(self, num_epochs: int = 1, batch_size: int = 32, global_params=None) -> Tuple[float, float]:
         """Train the model on the local dataset."""
         print(f"\n[Client Debug] Starting training for {num_epochs} epochs with batch size {batch_size}")
         self.model.train()
@@ -496,8 +518,10 @@ class FederatedClient(fl.client.NumPyClient):
         current_round = getattr(self.model, 'current_round', 0)
         total_rounds = self.cfg.get("total_rounds", 100)
         
-        self.model.tpLayer.current_round = current_round
-        self.model.tpLayer.adjust_loss_threshold(current_round, total_rounds)
+        # Skip TinyProp layer updates for FedPrune
+        if not self.is_fedprune:
+            self.model.tpLayer.current_round = current_round
+            self.model.tpLayer.adjust_loss_threshold(current_round, total_rounds)
         
         progress = current_round / total_rounds
         progressive_factor = 1.0 + (self.S_max - self.S_min) * (progress ** 2)
@@ -516,7 +540,18 @@ class FederatedClient(fl.client.NumPyClient):
         mem_report = estimate_model_memory(self.model, batch_size=sample_input.shape[0], input_shape=sample_input.shape[1:])
         total_memory = mem_report["total_MB"]
         
-        layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
+        # Initialize layer sparsity tracking
+        layer_sparsity = {}
+        if self.is_fedprune:
+            # For FedPrune, calculate actual layer sparsity from masks
+            for name, param in self.model.named_parameters():
+                if len(param.shape) > 1:  # Only for weight matrices
+                    nonzero_count = (param.data != 0).sum().item()
+                    layer_sparsity[name] = 1.0 - (nonzero_count / param.numel())
+            # Add to epoch sparsities for tracking
+            epoch_effective_sparsities.append(np.mean(list(layer_sparsity.values())))
+        else:
+            layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
         
         for epoch in range(num_epochs):
             for batch_idx, (inputs, targets) in enumerate(self.train_loader):
@@ -525,6 +560,20 @@ class FederatedClient(fl.client.NumPyClient):
                 self.optimizer.zero_grad()
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
+                
+                # FedProx proximal term with proper parameter handling
+                if self.cfg.get("use_fedprox", False) and global_params is not None:
+                    fedprox_mu = self.cfg.get("fedprox_mu", 0.1)
+                    proximal_term = 0.0
+                    
+                    # Only iterate over trainable parameters
+                    for name, param in self.model.named_parameters():
+                        if name in global_params:
+                            global_param = global_params[name].to(self.device)
+                            diff = param - global_param
+                            proximal_term += (diff**2).sum()
+                    
+                    loss += (fedprox_mu / 2) * proximal_term
                 
                 loss_history.append(loss.item())
                 if len(loss_history) > loss_window_size:
@@ -539,6 +588,7 @@ class FederatedClient(fl.client.NumPyClient):
                     self.zeta = max(0.1, min(2.0, self.zeta))
                 
                 loss.backward()
+                
                 if self.quantization_enabled:
                     for name, param in self.model.named_parameters():
                         if param.grad is not None:
@@ -560,7 +610,8 @@ class FederatedClient(fl.client.NumPyClient):
                 if grad_norm > 0:
                     epoch_grad_norms.append(grad_norm)
                     
-                    if not self.is_dense_baseline:
+                    # Skip TinyProp updates for FedPrune
+                    if not self.is_dense_baseline and not self.is_fedprune:
                         self.model.tpLayer.update_phi(self.model.tpParams, loss.item(), batch_idx)
                         
                         if self.model.tpLayer.should_skip_batch(loss.item(), self.model.tpParams):
@@ -569,6 +620,14 @@ class FederatedClient(fl.client.NumPyClient):
                     
                     if self.is_dense_baseline:
                         layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
+                    elif self.is_fedprune:
+                        # For FedPrune, recalculate layer sparsity from current masks
+                        for name, param in self.model.named_parameters():
+                            if len(param.shape) > 1:  # Only for weight matrices
+                                nonzero_count = (param.data != 0).sum().item()
+                                layer_sparsity[name] = 1.0 - (nonzero_count / param.numel())
+                        # Add to epoch sparsities for tracking
+                        epoch_effective_sparsities.append(np.mean(list(layer_sparsity.values())))
                     else:
                         if self.adaptive_sparsity:
                             phi = self.update_adaptive_sparsity(grad_norm)
