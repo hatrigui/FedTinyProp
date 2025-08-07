@@ -1,10 +1,10 @@
-# Python cache
+
 __pycache__/
 *.py[cod]
 
-# Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
-# Dataset & outputs (optional - depending on size)
 notebooks/data/
 data/
+
+notebooks/results/checkpoints/

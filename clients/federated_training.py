@@ -2,6 +2,7 @@ from typing import List, Dict, Optional
 import torch
 from torch.utils.data import DataLoader
 from clients.federated_client import FederatedClient
+from clients.rigl_client import FederatedRigLClient
 from models.model import get_tinyprop_model 
 from models.config import get_tinyprop_config, get_dense_config
 from utils.early_stopping import EarlyStoppingMonitor
@@ -15,7 +16,9 @@ import numpy as np
 import random
 import os
 import pandas as pd
+import json
 from datetime import datetime
+from pathlib import Path
 
 def evaluate_model(model, data_loader):
     """Evaluate model accuracy on a given data loader."""
@@ -61,8 +64,13 @@ def federated_training(
     use_dense_baseline: bool = False,
     use_fedprox: bool = False,
     use_fedprune: bool = False,
+    use_rigl: bool = False,
     fedprox_mu: float = 0.1,
     fedprune_sparsity: float = 0.5,
+    rigl_initial_sparsity: float = 0.5,
+    rigl_target_sparsity: float = 0.9,
+    rigl_update_interval: int = 100,
+    rigl_final_update_epoch: int = 100,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -78,6 +86,7 @@ def federated_training(
         "round": [],
         "accuracy": [],
         "flops": [],
+        "rigl_sparsity": [],  # Always initialize as empty list
         "memory": [],
         "memory_saved": [],
         "communication": [],
@@ -129,15 +138,30 @@ def federated_training(
         client_cfg["use_fedprox"] = use_fedprox
         client_cfg["fedprox_mu"] = fedprox_mu
         
-        client = FederatedClient(
-            client_id=i,
-            model=client_model,
-            train_loader=train_loader,
-            test_loader=test_loader,
-            cfg=client_cfg,
-            device=device,
-            dataset_name=model_name
-        )
+        if use_rigl:
+            client = FederatedRigLClient(
+                client_id=i,
+                model=client_model,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                cfg=client_cfg,
+                device=device,
+                dataset_name=model_name,
+                rigl_initial_sparsity=rigl_initial_sparsity,
+                rigl_target_sparsity=rigl_target_sparsity,
+                rigl_update_interval=rigl_update_interval,
+                rigl_final_update_epoch=rigl_final_update_epoch
+            )
+        else:
+            client = FederatedClient(
+                client_id=i,
+                model=client_model,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                cfg=client_cfg,
+                device=device,
+                dataset_name=model_name
+            )
         clients.append(client)
         print(f"[Training Debug] Client {i} initialized with {dataset_sizes[i]} samples")
 
@@ -197,11 +221,14 @@ def federated_training(
             method = "FedProx"
         elif use_fedprune:
             method = "FedPrune"
+        elif use_rigl:
+            method = "RigL"
 
         # Set current round for all clients
         for client in clients:
             client.model.current_round = rnd
-            if not use_dense_baseline:
+            # Only adjust TinyProp parameters if not using dense baseline or RigL
+            if not use_dense_baseline and not use_rigl:
                 client.model.tpLayer.adjust_loss_threshold(rnd, rounds)
                 client.model.tpLayer.reset_batch_stats()
 
@@ -269,6 +296,18 @@ def federated_training(
         metrics_log["client_eval_history"].append(
             {cid: client.local_evaluate(client.test_loader) for cid, client in enumerate(clients)}
         )
+        
+        # Add RigL-specific metrics if enabled
+        if use_rigl:
+            rigl_sparsity = sum(client.rigl_metrics["current_sparsity"] for client in clients) / len(clients) if clients else 0.0
+            metrics_log["rigl_sparsity"].append(rigl_sparsity)
+            
+            # Log RigL mask updates (only for logging, not in metrics_log)
+            total_mask_updates = sum(client.rigl_metrics["mask_updates"] for client in clients)
+            print(f"[Training Debug] RigL mask updates: {total_mask_updates}")
+        else:
+            # Add a placeholder value for non-RigL runs to keep array lengths consistent
+            metrics_log["rigl_sparsity"].append(0.0)
 
         # Save to single CSV file
         if csv_log_path:
@@ -427,15 +466,62 @@ def federated_training(
                 print(f"Metrics lengths: {lengths}")
 
         # Print round summary
-        print(f"\nRound {rnd + 1} Summary:")
-        print(f"Accuracy: {round_metrics['accuracy']:.4f}")
-        print(f"Communication: {round_metrics['communication_MB']:.2f}MB (Download: {round_metrics['download_KB']:.2f}KB, Upload: {round_metrics['upload_KB']:.2f}KB)")
-        print(f"Model Size: {round_metrics['model_size_KB']:.2f}KB")
-        print(f"Compression Ratio: {round_metrics['compression_ratio']:.2f}x")
-        print(f"Sparsity: {round_metrics['sparsity']:.2%}")
-        print(f"Skipped Batches: {round_metrics['skipped_batches']}")
-        print(f"Effective Compute Ratio: {round_metrics['effective_compute_ratio']:.4f}")
+        print(f"[Training Debug][Round {rnd+1}/{rounds}] Accuracy: {acc:.4f}, Sparsity: {metrics_log['sparsity'][-1]:.4f}")
+        print(f"[Training Debug][Round {rnd+1}/{rounds}] FLOPs: {metrics_log['flops'][-1]:.2f}, Memory: {metrics_log['memory'][-1]:.2f} bytes")
+        print(f"[Training Debug][Round {rnd+1}/{rounds}] Communication: {metrics_log['communication'][-1]:.2f} bytes")
+        print(f"[Training Debug][Round {rnd+1}/{rounds}] Compression ratio: {metrics_log['compression_ratio'][-1]:.2f}")
+        print(f"[Training Debug][Round {rnd+1}/{rounds}] Skipped batches: {metrics_log['skipped_batches'][-1]}, Effective compute ratio: {metrics_log['effective_compute_ratio'][-1]:.4f}")
+        
+        # Print RigL-specific metrics if enabled
+        if use_rigl:
+            print(f"[Training Debug][Round {rnd+1}/{rounds}] RigL sparsity: {metrics_log['rigl_sparsity'][-1]:.4f}")
+            
+        # Save intermediate model checkpoints if requested
+        if save_dir and save_interval > 0 and (rnd + 1) % save_interval == 0:
+            checkpoint_dir = os.path.join(save_dir, "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            
+            # Determine model type
+            model_type = "dense" if use_dense_baseline else "tinyprop" if not use_rigl else "rigl"
+            
+            # Save intermediate checkpoint
+            checkpoint_path = os.path.join(checkpoint_dir, f"{model_type}_{model_name}_round{rnd+1}.pt")
+            torch.save(global_model.state_dict(), checkpoint_path)
+            print(f"[INFO] Saved intermediate {model_type} model checkpoint to {checkpoint_path}")
 
+    # Save final model checkpoints for hardware evaluation
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Create model checkpoint directory
+        checkpoint_dir = os.path.join(save_dir, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Save model checkpoint
+        model_type = "dense" if use_dense_baseline else "tinyprop" if not use_rigl else "rigl"
+        checkpoint_path = os.path.join(checkpoint_dir, f"{model_type}_{model_name}.pt")
+        
+        # Save model state dictionary
+        torch.save(global_model.state_dict(), checkpoint_path)
+        print(f"\n[INFO] Saved {model_type} model checkpoint to {checkpoint_path}")
+        
+        # Save full checkpoint with metrics
+        full_checkpoint_path = os.path.join(checkpoint_dir, f"{model_type}_{model_name}_full.pt")
+        torch.save({
+            'global_model_state_dict': global_model.state_dict(),
+            'rounds': rounds,
+            'final_accuracy': consolidated_metrics["accuracy"],
+            'sparsity': consolidated_metrics["sparsity"],
+            'compression_ratio': consolidated_metrics["compression_ratio"],
+            'model_name': model_name,
+            'model_type': model_type,
+            'use_dense_baseline': use_dense_baseline,
+            'use_rigl': use_rigl,
+            'use_fedprox': use_fedprox,
+            'use_fedprune': use_fedprune
+        }, full_checkpoint_path)
+        print(f"[INFO] Saved full {model_type} checkpoint with metrics to {full_checkpoint_path}")
+    
     return (
         global_model,
         consolidated_metrics["accuracy"],
