@@ -6,5 +6,5 @@ __pycache__/
 
 notebooks/data/
 data/
+results/
 
-notebooks/results/checkpoints/

@@ -89,6 +89,8 @@ def federated_training(
         "rigl_sparsity": [],  # Always initialize as empty list
         "memory": [],
         "memory_saved": [],
+        "sram_usage": [],
+        "latency_ms": [],
         "communication": [],
         "sparsity": [],
         "skipped_batches": [],
@@ -183,6 +185,8 @@ def federated_training(
         "flops": [],
         "memory": [],
         "memory_saved": [],
+        "sram_usage": [],
+        "latency_ms": [],
         "communication": [],
         "sparsity": [],
         "skipped_batches": [],
@@ -193,6 +197,7 @@ def federated_training(
         "model_size_bytes": [],
         "quantization_error": [],
         "avg_scale_factor": [],
+        "smoothed_phi": [],  # Added smoothed gradient-norm signal metric
         "method": []
     }
 
@@ -364,6 +369,9 @@ def federated_training(
         total_original_size = sum(client.communication_metrics['model_size_bytes'] for client in clients)
         total_compressed_size = sum(client.communication_metrics['upload_bytes'] for client in clients)
         compression_ratio = total_original_size / total_compressed_size if total_compressed_size > 0 else 1.0
+        
+        # Calculate average smoothed_phi across all clients
+        avg_smoothed_phi = sum(getattr(client, 'smoothed_phi', 0.0) for client in clients) / len(clients) if clients else 0.0
 
         # Update consolidated metrics with current timestamp
         current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -373,6 +381,101 @@ def federated_training(
         consolidated_metrics["flops"].append(sum(client.last_flops for client in clients) / len(clients))
         consolidated_metrics["memory"].append(max(client.last_mem for client in clients))
         consolidated_metrics["memory_saved"].append(sum(client.last_mem_saved for client in clients) / len(clients))
+        consolidated_metrics["smoothed_phi"].append(avg_smoothed_phi)  # Add smoothed gradient-norm signal
+        
+        # Add SRAM and latency metrics
+        try:
+            # Get current SRAM usage
+            from utils.rpi_utils import get_raspberry_pi_memory_usage
+            memory_info = get_raspberry_pi_memory_usage()
+            sram_usage = memory_info.get('sram_used_mb', 0)
+            
+            # Measure inference latency
+            import time
+            
+            # Create a small dummy batch for latency measurement
+            dummy_input = torch.rand(4, 3, 32, 32).to(device)
+            
+            # Measure inference time
+            start_time = time.time()
+            with torch.no_grad():
+                global_model(dummy_input)
+            end_time = time.time()
+            latency = (end_time - start_time) * 1000  # Convert to ms
+            
+            # Get CPU temperature
+            from utils.rpi_utils import get_raspberry_pi_temperature
+            temperature = get_raspberry_pi_temperature()
+            
+            # Get CPU usage
+            import psutil
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            
+            # Get memory usage details
+            mem = psutil.virtual_memory()
+            total_memory_mb = mem.total / (1024 * 1024)
+            available_memory_mb = mem.available / (1024 * 1024)
+            used_memory_mb = mem.used / (1024 * 1024)
+            memory_percent = mem.percent
+            
+            consolidated_metrics["sram_usage"].append(sram_usage)
+            consolidated_metrics["latency_ms"].append(latency)
+            
+            # Also update the metrics_log
+            if len(metrics_log["sram_usage"]) <= rnd:
+                metrics_log["sram_usage"].append(sram_usage)
+            if len(metrics_log["latency_ms"]) <= rnd:
+                metrics_log["latency_ms"].append(latency)
+                
+            # Create embedded metrics dictionary for this round
+            embedded_metrics = {
+                "timestamp": current_timestamp,
+                "round": rnd + 1,
+                "sram_usage_mb": sram_usage,
+                "latency_ms": latency,
+                "cpu_temperature": temperature,
+                "cpu_percent": cpu_percent,
+                "total_memory_mb": total_memory_mb,
+                "available_memory_mb": available_memory_mb,
+                "used_memory_mb": used_memory_mb,
+                "memory_percent": memory_percent,
+                "flops": sum(client.last_flops for client in clients) / len(clients),
+                "memory": max(client.last_mem for client in clients),
+                "memory_saved": sum(client.last_mem_saved for client in clients) / len(clients),
+                "sparsity": sum(client.last_sparsity for client in clients) / len(clients),
+                "effective_compute_ratio": effective_compute_ratio,
+                "compression_ratio": compression_ratio,
+                "model_size_bytes": model_size,
+                "method": method
+            }
+            
+            # Save embedded metrics to a separate CSV file
+            if save_dir:
+                embedded_metrics_df = pd.DataFrame([embedded_metrics])
+                embedded_metrics_csv_path = os.path.join(save_dir, f"{partition_type}_{model_name}_embedded_metrics.csv")
+                
+                # Check if file exists to determine if we need to write headers
+                file_exists = os.path.isfile(embedded_metrics_csv_path)
+                
+                # Append to the CSV file (or create it if it doesn't exist)
+                embedded_metrics_df.to_csv(
+                    embedded_metrics_csv_path,
+                    mode='a' if file_exists else 'w',
+                    header=not file_exists,
+                    index=False
+                )
+                
+        except Exception as e:
+            print(f"[Warning] Failed to collect embedded metrics: {str(e)}")
+            consolidated_metrics["sram_usage"].append(0)
+            consolidated_metrics["latency_ms"].append(0)
+            
+            # Also update the metrics_log with zeros
+            if len(metrics_log["sram_usage"]) <= rnd:
+                metrics_log["sram_usage"].append(0)
+            if len(metrics_log["latency_ms"]) <= rnd:
+                metrics_log["latency_ms"].append(0)
+        
         consolidated_metrics["communication"].append(total_comm)
         consolidated_metrics["sparsity"].append(sum(client.last_sparsity for client in clients) / len(clients))
         consolidated_metrics["skipped_batches"].append(total_skipped)
