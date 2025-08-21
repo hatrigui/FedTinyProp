@@ -205,7 +205,8 @@ class FederatedClient(fl.client.NumPyClient):
             'download_bytes': self.communication_metrics['download_bytes'],
             'upload_bytes': self.communication_metrics['upload_bytes'],
             'model_size_bytes': self.communication_metrics['model_size_bytes'],
-            'compression_ratio': self.communication_metrics['compression_ratio']
+            'compression_ratio': self.communication_metrics['compression_ratio'],
+            'smoothed_adaptivity_factor': self.smoothed_phi if hasattr(self, 'smoothed_phi') else None
         }
 
     def fit(self, parameters, config):
