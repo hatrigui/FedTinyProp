@@ -14,7 +14,6 @@ FedTinyProp is a federated learning framework designed for resource-constrained 
   - FedTinyProp (adaptive sparsity)
   - Dense (baseline)
   - FedProx (with regularization)
-  - FedPrune (static pruning)
   - RigL (dynamic sparse training)
 - **Comprehensive Metrics**: Tracks accuracy, FLOPs, memory usage, communication costs, sparsity, and more
 - **Raspberry Pi Optimization**: Specialized support for deployment on Raspberry Pi devices
@@ -56,7 +55,7 @@ FedTinyProp is a federated learning framework designed for resource-constrained 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/FedTinyProp.git
+git clone https://github.com/hatrigui/FedTinyProp
 cd FedTinyProp
 
 # Create and activate a virtual environment (optional but recommended)
@@ -75,6 +74,7 @@ pip install -r requirements.txt
 from clients.federated_training import federated_training
 from utils.data_partition import create_federated_datasets
 from clients.aggregators import sparse_fedavg_aggregate
+import torch
 
 # Create federated datasets
 client_datasets, test_dataset = create_federated_datasets(
@@ -92,26 +92,24 @@ tinyprop_params = {
 }
 
 # Train the model
-model, accuracy, flops, memory, memory_saved, communication, sparsity, skipped_batches, \
-    effective_compute_ratio, client_history, compression_ratio, quantization_error, \
-    avg_scale_factor, history = federated_training(
-        client_datasets=client_datasets,
-        model_name="cifar10",
-        testset=test_dataset,
-        tinyprop_params=tinyprop_params,
-        aggregator_fn=sparse_fedavg_aggregate,
-        rounds=100,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        local_epochs=5,
-        quantization_bits=8,
-        save_dir="./results"
-    )
+model, metrics = federated_training(
+    client_datasets=client_datasets,
+    model_name="cifar10",
+    testset=test_dataset,
+    tinyprop_params=tinyprop_params,
+    aggregator_fn=sparse_fedavg_aggregate,
+    rounds=100,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    local_epochs=5,
+    quantization_bits=8,
+    save_dir="./results"
+)
 ```
 
 ### Using Different Training Methods
 
 ```python
-# Dense baseline
+# Dense baseline (disables FedTinyProp)
 model, metrics = federated_training(
     # ... other parameters ...
     use_dense_baseline=True
@@ -128,12 +126,89 @@ model, metrics = federated_training(
 model, metrics = federated_training(
     # ... other parameters ...
     use_rigl=True,
-    rigl_initial_sparsity=0.5,
-    rigl_target_sparsity=0.95,
-    rigl_update_interval=100,
-    rigl_final_update_epoch=100
+    rigl_initial_sparsity=0.5,  # Initial sparsity level
+    rigl_target_sparsity=0.95,  # Final target sparsity
+    rigl_update_interval=100,    # How often to update masks
+    rigl_final_update_epoch=100  # When to stop updating masks
 )
 ```
+
+### Example Training Loop with Multiple Benchmarks
+
+The following example shows how to train and analyze a model with different data partitioning strategies:
+
+```python
+from clients.federated_training import federated_training
+from clients.aggregators import sparse_fedavg_aggregate
+from utils.data_partition import create_federated_datasets
+import torch
+import numpy as np
+
+def train_and_analyze_partition(partition_name, client_datasets, tinyprop_params):
+    print(f"\nTraining on partition: {partition_name.upper()}")
+    
+    # Run training
+    model, metrics = federated_training(
+        client_datasets=client_datasets,
+        model_name='speechcommands',
+        testset=test_dataset,
+        tinyprop_params=tinyprop_params,
+        aggregator_fn=sparse_fedavg_aggregate,
+        rounds=100,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        local_epochs=1,
+        early_stopping_patience=100,  # Stop if no improvement for 100 rounds
+        early_stopping_delta=0.001,   # Minimum improvement to continue
+        csv_log_path=f'results/speechcommands_metrics.csv',
+        initial_sparsity=tinyprop_params.S_min,
+        target_sparsity=tinyprop_params.S_max,
+        energy_budget=1000,           # Energy constraint for devices
+        save_dir='results',
+        save_interval=1,               # Save model every N rounds
+        
+        # Training method flags (only one should be True at a time)
+        use_dense_baseline=False,      # Dense baseline (no sparsity)
+        use_fedprox=False,             # FedProx regularization
+        fedprox_mu=0.01,               # FedProx regularization strength
+        use_rigl=True,                 # RigL dynamic sparse training
+        rigl_initial_sparsity=0.5,     # Initial RigL sparsity
+        rigl_target_sparsity=0.95,     # Target RigL sparsity
+        rigl_update_interval=100,      # How often to update masks
+        rigl_final_update_epoch=100,   # When to stop updating masks
+    )
+```
+
+### Notebooks for Different Datasets
+
+The `notebooks/` directory contains Jupyter notebooks for experimenting with different datasets:
+
+- `SpeechCommands_5cl.ipynb`: Speech Commands dataset with 5 clients
+- `cifar10.ipynb`: CIFAR-10 image classification
+- `cifar100_5cl.ipynb`: CIFAR-100 with 5 clients
+- `fashionmnist_5cl.ipynb`: Fashion MNIST with 5 clients
+- And more...
+
+Each notebook contains dataset-specific preprocessing and training loops. You can use these notebooks as templates for your own experiments.
+
+### Key Parameters
+
+- **Training Method Flags**: Set only one to `True` at a time
+  - `use_dense_baseline=True`: Standard training without sparsity (baseline)
+  - `use_fedprox=True`: FedProx with regularization
+  - `use_rigl=True`: RigL dynamic sparse training
+  - All `False`: Default FedTinyProp with adaptive sparsity
+
+- **TinyProp Parameters**:
+  - `S_min`: Minimum sparsity level (0.0-1.0)
+  - `S_max`: Maximum sparsity level (0.0-1.0)
+  - `zeta`: Sparsity scaling factor
+  - `phi_min`: Minimum gradient norm threshold
+
+- **RigL Parameters**:
+  - `rigl_initial_sparsity`: Starting sparsity level
+  - `rigl_target_sparsity`: Final target sparsity level
+  - `rigl_update_interval`: How often to update masks (iterations)
+  - `rigl_final_update_epoch`: When to stop updating masks
 
 ## Raspberry Pi Deployment
 
