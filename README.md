@@ -238,27 +238,6 @@ The core innovation in FedTinyProp is its adaptive sparsity mechanism:
 3. **Batch Skipping**: Intelligently skips batches when gradients are below threshold
 4. **Top-K Selection**: Selects only the most important gradient elements for updates
 
-## RigL Integration
-
-FedTinyProp also integrates RigL (Rigged Lottery) sparse training:
-
-1. **Dynamic Connectivity**: Changes sparse connectivity patterns during training
-2. **Momentum-Based Regrowth**: Uses gradient information for weight regrowth
-3. **Cosine Sparsity Schedule**: Gradually increases sparsity during training
-
-## Citation
-
-If you use FedTinyProp in your research, please cite:
-
-```bibtex
-@article{fedtinyprop2023,
-  title={FedTinyProp: Federated Learning with Adaptive Sparsity for Resource-Constrained Edge Devices},
-  author={Author, A. and Author, B.},
-  journal={arXiv preprint arXiv:xxxx.xxxxx},
-  year={2023}
-}
-```
-
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
