@@ -11,6 +11,7 @@ from typing import Dict, Tuple
 import os
 import psutil
 import pandas as pd
+import time
 from torch.utils.data import DataLoader
 from utils.flops_calculator import compute_model_flops
 from utils.memory_calculator import estimate_model_memory
@@ -19,6 +20,7 @@ class FederatedClient(fl.client.NumPyClient):
     def __init__(self, client_id: int, model: nn.Module, train_loader: DataLoader, 
                  test_loader: DataLoader, cfg: dict, device: str = None, dataset_name: str = None):
         super().__init__()
+
         self.client_id = client_id
         self.model = model
         self.train_loader = train_loader
@@ -58,6 +60,8 @@ class FederatedClient(fl.client.NumPyClient):
         self.last_flops = 0.0
         self.last_mem = 0.0
         self.last_mem_saved = 0.0
+        self.last_dense_flops_ref = 0.0
+        self.last_saved_flops_est = 0.0
         self.last_comm = 0.0
         self.last_sparsity = 0.0
         self.last_avg_grad_norm = 0.0
@@ -106,7 +110,13 @@ class FederatedClient(fl.client.NumPyClient):
         self.smoothed_phi = None
         self.initial_grad_norms = []
         self.INITIAL_GRAD_NORM_BATCHES = 5
-        self.adaptive_sparsity = True
+
+        self.enable_controller = bool(self.cfg.get("enable_controller", True))
+        self.enable_skip = bool(self.cfg.get("enable_skip", True))
+        self.enable_topk = bool(self.cfg.get("enable_topk", True))
+        self.adaptive_sparsity = bool(self.cfg.get("adaptive_sparsity", True))
+        self.fixed_phi = float(self.cfg.get("fixed_phi", 1.0))
+        self.enable_zeta_tuning = bool(self.cfg.get("enable_zeta_tuning", True))
         
         self.phi_ema_alpha = 0.9
         self.target_sparsity_adjustment_rate = 0.1
@@ -143,7 +153,11 @@ class FederatedClient(fl.client.NumPyClient):
             "momentum": 0.9
         })
         self.quantization_bits = quantization_cfg.get("bits", 8)
-        self.quantization_enabled = quantization_cfg.get("enabled", False)
+        enable_quant_override = self.cfg.get("enable_quantization", None)
+        if enable_quant_override is None:
+            self.quantization_enabled = bool(quantization_cfg.get("enabled", False))
+        else:
+            self.quantization_enabled = bool(enable_quant_override)
         self.adaptive_quantization = quantization_cfg.get("adaptive", True)
         self.min_bits = quantization_cfg.get("min_bits", 4)
         self.max_bits = quantization_cfg.get("max_bits", 16)
@@ -171,6 +185,19 @@ class FederatedClient(fl.client.NumPyClient):
             'layer_communications': {}
         }
 
+        self.enable_profiling = bool(self.cfg.get("enable_profiling", False))
+        self.last_timing_ms = {
+            "forward": 0.0,
+            "backward": 0.0,
+            "grad_norm": 0.0,
+            "controller": 0.0,
+            "topk": 0.0,
+            "quant": 0.0,
+            "opt_step": 0.0,
+            "delta": 0.0,
+            "total": 0.0,
+        }
+
     def get_parameters(self):
         """Get model parameters as a list of NumPy arrays."""
         state_dict = self.model.state_dict()
@@ -195,8 +222,10 @@ class FederatedClient(fl.client.NumPyClient):
 
     def get_metrics(self) -> Dict[str, float]:
         """Get client metrics."""
-        return {
+        metrics = {
             'flops': self.last_flops,
+            'dense_flops_ref': self.last_dense_flops_ref,
+            'saved_flops_est': self.last_saved_flops_est,
             'memory': self.last_mem,
             'memory_saved': self.last_mem_saved,
             'communication': self.last_comm,
@@ -208,6 +237,21 @@ class FederatedClient(fl.client.NumPyClient):
             'compression_ratio': self.communication_metrics['compression_ratio'],
             'smoothed_adaptivity_factor': self.smoothed_phi if hasattr(self, 'smoothed_phi') else None
         }
+
+        if self.enable_profiling:
+            metrics.update({
+                "time_forward_ms": self.last_timing_ms.get("forward", 0.0),
+                "time_backward_ms": self.last_timing_ms.get("backward", 0.0),
+                "time_grad_norm_ms": self.last_timing_ms.get("grad_norm", 0.0),
+                "time_controller_ms": self.last_timing_ms.get("controller", 0.0),
+                "time_topk_ms": self.last_timing_ms.get("topk", 0.0),
+                "time_quant_ms": self.last_timing_ms.get("quant", 0.0),
+                "time_opt_step_ms": self.last_timing_ms.get("opt_step", 0.0),
+                "time_delta_ms": self.last_timing_ms.get("delta", 0.0),
+                "time_total_ms": self.last_timing_ms.get("total", 0.0),
+            })
+
+        return metrics
 
     def fit(self, parameters, config):
         """Train the model on the local dataset."""
@@ -350,9 +394,9 @@ class FederatedClient(fl.client.NumPyClient):
                 if len(param.shape) > 1:  # Only for weight matrices
                     layer_sparsity[name] = 1.0 - (nonzero_count / param.numel())
         
-        # Calculate memory saved
-        self.last_mem = total_memory
-        self.last_mem_saved = max(0, total_memory - sparse_memory)
+        # Calculate memory saved (report in MB; bytes are used for communication columns)
+        self.last_mem = total_memory / (1024 * 1024)
+        self.last_mem_saved = max(0, total_memory - sparse_memory) / (1024 * 1024)
         
         # Calculate communication metrics
         self.communication_metrics['model_size_bytes'] = total_memory
@@ -364,21 +408,40 @@ class FederatedClient(fl.client.NumPyClient):
             self.communication_metrics['compression_ratio'] = total_memory / sparse_memory
         else:
             self.communication_metrics['compression_ratio'] = 1.0
-            
+
         # Calculate total communication
         self.last_comm = self.communication_metrics['download_bytes'] + self.communication_metrics['upload_bytes']
-        
+
         # Calculate sparsity
         self.last_sparsity = 1.0 - (nonzero_params / total_params) if total_params > 0 else 0.0
-        
+
         # Calculate FLOPs with proper sparsity consideration
-        if self.is_fedprune:
-            # For FedPrune, use the actual layer-wise sparsity from the masks
-            self.last_flops = compute_model_flops(self.model, layer_sparsity=layer_sparsity)
+        try:
+            sample_input, _ = next(iter(self.train_loader))
+            input_shape = sample_input.shape
+        except Exception:
+            try:
+                sample_input, _ = next(iter(self.test_loader))
+                input_shape = sample_input.shape
+            except Exception:
+                input_shape = None
+
+        if input_shape is None:
+            self.last_flops = 0.0
         else:
-            # For other methods, use the existing FLOPs calculation
-            self.last_flops = compute_model_flops(self.model)
-        
+            layer_sparsity_dict = None
+            if self.is_fedprune:
+                layer_sparsity_dict = {}
+                for module_name, module in self.model.named_modules():
+                    if isinstance(module, (nn.Conv2d, nn.Linear)) and hasattr(module, "weight") and module.weight is not None:
+                        w = module.weight.data
+                        nz = (w != 0).sum().item()
+                        tot = w.numel()
+                        layer_sparsity_dict[module_name] = 1.0 - (float(nz) / float(tot)) if tot > 0 else 0.0
+
+            flops, _ = compute_model_flops(self.model, input_shape, layer_sparsity_dict)
+            self.last_flops = float(flops)
+
         return {
             'flops': self.last_flops,
             'memory': self.last_mem,
@@ -504,6 +567,7 @@ class FederatedClient(fl.client.NumPyClient):
         """Train the model on the local dataset."""
         print(f"\n[Client Debug] Starting training for {num_epochs} epochs with batch size {batch_size}")
         self.model.train()
+        
         total_loss = 0.0
         correct = 0
         total = 0
@@ -540,6 +604,10 @@ class FederatedClient(fl.client.NumPyClient):
         sample_input, _ = next(iter(self.train_loader))
         mem_report = estimate_model_memory(self.model, batch_size=sample_input.shape[0], input_shape=sample_input.shape[1:])
         total_memory = mem_report["total_MB"]
+
+        # Dense FLOPs reference for this client's local round (estimate, used for savings ratios)
+        dense_batch_flops, _ = compute_model_flops(self.model, sample_input.shape, layer_sparsity_dict=None)
+        dense_round_flops_ref = float(dense_batch_flops) * float(len(self.train_loader)) * float(num_epochs)
         
         # Initialize layer sparsity tracking
         layer_sparsity = {}
@@ -554,11 +622,28 @@ class FederatedClient(fl.client.NumPyClient):
         else:
             layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
         
+        timing_s = {
+            "forward": 0.0,
+            "backward": 0.0,
+            "grad_norm": 0.0,
+            "controller": 0.0,
+            "topk": 0.0,
+            "quant": 0.0,
+            "opt_step": 0.0,
+            "delta": 0.0,
+            "total": 0.0,
+        }
+
+        train_start = time.perf_counter() if self.enable_profiling else None
+
         for epoch in range(num_epochs):
             for batch_idx, (inputs, targets) in enumerate(self.train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
                 self.optimizer.zero_grad()
+
+                if self.enable_profiling:
+                    t0 = time.perf_counter()
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
                 
@@ -575,32 +660,50 @@ class FederatedClient(fl.client.NumPyClient):
                             proximal_term += (diff**2).sum()
                     
                     loss += (fedprox_mu / 2) * proximal_term
+
+                if self.enable_profiling:
+                    timing_s["forward"] += time.perf_counter() - t0
                 
                 loss_history.append(loss.item())
                 if len(loss_history) > loss_window_size:
                     loss_history.pop(0)
                 
-                if len(loss_history) == loss_window_size:
-                    loss_change = abs(loss_history[-1] - loss_history[0])
-                    if loss_change < zeta_adjustment_threshold:
-                        self.zeta *= 1.05
-                    elif loss_change > zeta_adjustment_threshold * 2:
-                        self.zeta *= 0.95
-                    self.zeta = max(0.1, min(2.0, self.zeta))
+                if self.enable_zeta_tuning:
+                    if len(loss_history) == loss_window_size:
+                        loss_change = abs(loss_history[-1] - loss_history[0])
+                        if loss_change < zeta_adjustment_threshold:
+                            self.zeta *= 1.05
+                        elif loss_change > zeta_adjustment_threshold * 2:
+                            self.zeta *= 0.95
+                        self.zeta = max(0.1, min(2.0, self.zeta))
                 
+                if self.enable_profiling:
+                    t0 = time.perf_counter()
                 loss.backward()
+                if self.enable_profiling:
+                    timing_s["backward"] += time.perf_counter() - t0
                 
                 if self.quantization_enabled:
+                    if self.enable_profiling:
+                        t0 = time.perf_counter()
                     for name, param in self.model.named_parameters():
                         if param.grad is not None:
                             quantized_grad, error, scale = self.apply_quantization(param.grad, name)
                             param.grad.data = quantized_grad
+                    if self.enable_profiling:
+                        timing_s["quant"] += time.perf_counter() - t0
                 
+                if self.enable_profiling:
+                    t0 = time.perf_counter()
+
                 grad_norm = 0.0
                 for p in self.model.parameters():
                     if p.grad is not None:
                         grad_norm += p.grad.data.norm(2).item() ** 2
                 grad_norm = grad_norm ** 0.5
+
+                if self.enable_profiling:
+                    timing_s["grad_norm"] += time.perf_counter() - t0
                 
                 if grad_norm > grad_clip_threshold:
                     scale = grad_clip_threshold / (grad_norm + 1e-6)
@@ -612,10 +715,17 @@ class FederatedClient(fl.client.NumPyClient):
                     epoch_grad_norms.append(grad_norm)
                     
                     # Skip TinyProp updates for FedPrune
-                    if not self.is_dense_baseline and not self.is_fedprune:
+                    if not self.is_dense_baseline and not self.is_fedprune and self.enable_controller:
+                        if self.enable_profiling:
+                            t0 = time.perf_counter()
                         self.model.tpLayer.update_phi(self.model.tpParams, loss.item(), batch_idx)
+                        should_skip = False
+                        if self.enable_skip:
+                            should_skip = self.model.tpLayer.should_skip_batch(loss.item(), self.model.tpParams)
+                        if self.enable_profiling:
+                            timing_s["controller"] += time.perf_counter() - t0
                         
-                        if self.model.tpLayer.should_skip_batch(loss.item(), self.model.tpParams):
+                        if should_skip:
                             self.num_skipped_batches += 1
                             continue
                     
@@ -630,34 +740,53 @@ class FederatedClient(fl.client.NumPyClient):
                         # Add to epoch sparsities for tracking
                         epoch_effective_sparsities.append(np.mean(list(layer_sparsity.values())))
                     else:
-                        if self.adaptive_sparsity:
-                            phi = self.update_adaptive_sparsity(grad_norm)
+                        if self.enable_topk:
+                            if self.enable_profiling:
+                                t0 = time.perf_counter()
+                            if self.adaptive_sparsity:
+                                phi = self.update_adaptive_sparsity(grad_norm)
+                            else:
+                                phi = self.fixed_phi
                             self.apply_gradient_sparsification(phi)
-                            base_sparsity = self.S_min + (self.S_max - self.S_min) * (1 - phi)
-                            local_sparsity = min(self.S_max, base_sparsity * progressive_factor)
+                            if self.enable_profiling:
+                                timing_s["topk"] += time.perf_counter() - t0
+
+                            if self.adaptive_sparsity:
+                                base_sparsity = self.S_min + (self.S_max - self.S_min) * (1 - phi)
+                                local_sparsity = min(self.S_max, base_sparsity * progressive_factor)
+                            else:
+                                local_sparsity = max(self.S_min, min(self.S_max, self.zeta * phi))
                             epoch_effective_sparsities.append(local_sparsity)
                             layer_sparsity = {name: local_sparsity for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
+                        else:
+                            epoch_effective_sparsities.append(0.0)
+                            layer_sparsity = {name: 0.0 for name, _ in self.model.named_modules() if isinstance(_, (nn.Conv2d, nn.Linear))}
                     
                     batch_flops, _ = compute_model_flops(self.model, inputs.shape, layer_sparsity)
                     total_flops += batch_flops
 
+                if self.enable_profiling:
+                    t0 = time.perf_counter()
                 self.optimizer.step()
+                if self.enable_profiling:
+                    timing_s["opt_step"] += time.perf_counter() - t0
                 
                 total_loss += loss.item()
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
-            
-            if self.scheduler is not None:
-                self.scheduler.step()
         
         self.last_flops = total_flops
+        self.last_dense_flops_ref = dense_round_flops_ref
+        self.last_saved_flops_est = max(0.0, float(dense_round_flops_ref) - float(total_flops))
         self.last_mem = total_memory
         self.last_sparsity = np.mean(epoch_effective_sparsities) if epoch_effective_sparsities else 0.0
         self.last_avg_grad_norm = np.mean(epoch_grad_norms) if epoch_grad_norms else 0.0
         self.last_phi = self.model.phi_k
         
         # Calculate weight deltas and compression metrics
+        if self.enable_profiling:
+            t0_delta = time.perf_counter()
         self.weight_deltas = {}
         total_dense_size = 0
         total_sparse_size = 0
@@ -684,6 +813,23 @@ class FederatedClient(fl.client.NumPyClient):
                     threshold = max(relative_threshold, min_threshold)
                     
                     mask = delta.abs() > threshold
+
+                    # Enforce a target sparsity level for communicated deltas (top-k by magnitude)
+                    # This prevents dense deltas (e.g., due to weight_decay) from making upload_bytes constant.
+                    if self.enable_topk and not self.is_dense_baseline and not self.is_fedprune:
+                        keep_ratio = max(0.0, min(1.0, 1.0 - float(self.last_sparsity)))
+                        if keep_ratio < 1.0:
+                            flat_abs = delta.abs().view(-1)
+                            k = int(flat_abs.numel() * keep_ratio)
+                            if k <= 0:
+                                mask = torch.zeros_like(delta, dtype=torch.bool)
+                            elif k >= flat_abs.numel():
+                                mask = torch.ones_like(delta, dtype=torch.bool)
+                            else:
+                                _, topk_idx = torch.topk(flat_abs, k=k)
+                                flat_mask = torch.zeros_like(flat_abs, dtype=torch.bool)
+                                flat_mask[topk_idx] = True
+                                mask = flat_mask.view_as(delta)
                     
                     if len(delta.shape) > 1:
                         flat_delta = delta.view(-1)
@@ -716,6 +862,17 @@ class FederatedClient(fl.client.NumPyClient):
                         self.weight_deltas[name] = (None, torch.zeros_like(delta).cpu())
                         total_sparse_size += param.numel() * 4
         
+        if self.enable_profiling:
+            timing_s["delta"] += time.perf_counter() - t0_delta
+
+        if self.enable_profiling and train_start is not None:
+            timing_s["total"] = time.perf_counter() - train_start
+
+        if self.enable_profiling:
+            self.last_timing_ms = {k: v * 1000.0 for k, v in timing_s.items()}
+        else:
+            self.last_timing_ms = {k: 0.0 for k in self.last_timing_ms.keys()}
+        
         # Update communication metrics
         self.communication_metrics['model_size_bytes'] = total_dense_size
         self.communication_metrics['download_bytes'] = total_dense_size
@@ -723,7 +880,7 @@ class FederatedClient(fl.client.NumPyClient):
         self.communication_metrics['compression_ratio'] = total_dense_size / total_sparse_size if total_sparse_size > 0 else 1.0
         
         # Calculate memory saved
-        self.last_mem_saved = max(0, total_dense_size - total_sparse_size)
+        self.last_mem_saved = max(0, total_dense_size - total_sparse_size) / (1024 * 1024)
         
         return total_loss / len(self.train_loader), 100. * correct / total
 

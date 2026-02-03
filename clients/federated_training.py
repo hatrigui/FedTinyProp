@@ -72,6 +72,9 @@ def federated_training(
     rigl_update_interval: int = 100,
     rigl_final_update_epoch: int = 100,
     track_per_client_metrics: bool = False,
+    enable_profiling: bool = False,
+    ablation: str = "full",
+    fixed_phi: float = 1.0,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -85,13 +88,29 @@ def federated_training(
     metrics_log = {
         "timestamp": [],
         "round": [],
+        "method": [],
         "accuracy": [],
         "flops": [],
+        "dense_flops_ref": [],
+        "saved_flops_est": [],
+        "saved_flops_ratio": [],
         "rigl_sparsity": [],  # Always initialize as empty list
         "memory": [],
         "memory_saved": [],
         "sram_usage": [],
         "latency_ms": [],
+        "time_forward_ms": [],
+        "time_backward_ms": [],
+        "time_grad_norm_ms": [],
+        "time_controller_ms": [],
+        "time_topk_ms": [],
+        "time_quant_ms": [],
+        "time_opt_step_ms": [],
+        "time_delta_ms": [],
+        "time_total_ms": [],
+        "controller_overhead_pct": [],
+        "topk_overhead_pct": [],
+        "non_backprop_overhead_pct": [],
         "communication": [],
         "sparsity": [],
         "skipped_batches": [],
@@ -100,6 +119,9 @@ def federated_training(
         "download_bytes": [],
         "upload_bytes": [],
         "model_size_bytes": [],
+        "dense_upload_bytes_ref": [],
+        "saved_upload_bytes": [],
+        "saved_upload_ratio": [],
         "communication_KB": [],
         "communication_MB": [],
         "download_KB": [],
@@ -140,6 +162,35 @@ def federated_training(
         client_cfg = config.copy()
         client_cfg["use_fedprox"] = use_fedprox
         client_cfg["fedprox_mu"] = fedprox_mu
+        client_cfg["enable_profiling"] = enable_profiling
+
+        ablation_l = (ablation or "full").lower()
+        if not use_dense_baseline and not use_fedprune and not use_rigl:
+            if ablation_l in ["full", "default"]:
+                client_cfg["enable_controller"] = True
+                client_cfg["enable_skip"] = True
+                client_cfg["enable_topk"] = True
+                client_cfg["adaptive_sparsity"] = True
+                client_cfg["enable_zeta_tuning"] = True
+            elif ablation_l in ["adapt_only", "adapt-only", "adapt"]:
+                client_cfg["enable_controller"] = False
+                client_cfg["enable_skip"] = False
+                client_cfg["enable_topk"] = True
+                client_cfg["adaptive_sparsity"] = True
+                client_cfg["enable_zeta_tuning"] = True
+            elif ablation_l in ["skip_only", "skip-only", "skip"]:
+                client_cfg["enable_controller"] = True
+                client_cfg["enable_skip"] = True
+                client_cfg["enable_topk"] = False
+                client_cfg["adaptive_sparsity"] = False
+                client_cfg["enable_zeta_tuning"] = True
+            elif ablation_l in ["fixed_topk", "fixed-topk", "fixed"]:
+                client_cfg["enable_controller"] = False
+                client_cfg["enable_skip"] = False
+                client_cfg["enable_topk"] = True
+                client_cfg["adaptive_sparsity"] = False
+                client_cfg["fixed_phi"] = float(fixed_phi)
+                client_cfg["enable_zeta_tuning"] = False
         
         if use_rigl:
             client = FederatedRigLClient(
@@ -184,10 +235,25 @@ def federated_training(
         "round": [],
         "accuracy": [],
         "flops": [],
+        "dense_flops_ref": [],
+        "saved_flops_est": [],
+        "saved_flops_ratio": [],
         "memory": [],
         "memory_saved": [],
         "sram_usage": [],
         "latency_ms": [],
+        "time_forward_ms": [],
+        "time_backward_ms": [],
+        "time_grad_norm_ms": [],
+        "time_controller_ms": [],
+        "time_topk_ms": [],
+        "time_quant_ms": [],
+        "time_opt_step_ms": [],
+        "time_delta_ms": [],
+        "time_total_ms": [],
+        "controller_overhead_pct": [],
+        "topk_overhead_pct": [],
+        "non_backprop_overhead_pct": [],
         "communication": [],
         "sparsity": [],
         "skipped_batches": [],
@@ -196,6 +262,9 @@ def federated_training(
         "download_bytes": [],
         "upload_bytes": [],
         "model_size_bytes": [],
+        "dense_upload_bytes_ref": [],
+        "saved_upload_bytes": [],
+        "saved_upload_ratio": [],
         "quantization_error": [],
         "avg_scale_factor": [],
         "smoothed_phi": [],  # Added smoothed gradient-norm signal metric
@@ -229,6 +298,10 @@ def federated_training(
             method = "FedPrune"
         elif use_rigl:
             method = "RigL"
+        else:
+            ablation_l = (ablation or "full").lower()
+            if ablation_l not in ["full", "default"]:
+                method = f"FedTinyProp_{ablation_l}"
 
         # Set current round for all clients
         for client in clients:
@@ -267,10 +340,38 @@ def federated_training(
         # Update metrics log with consistent communication metrics
         metrics_log["timestamp"].append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         metrics_log["round"].append(rnd + 1)
+        metrics_log["method"].append(method)
         metrics_log["accuracy"].append(acc)
         metrics_log["flops"].append(sum(client.last_flops for client in clients) / len(clients))
         metrics_log["memory"].append(max(client.last_mem for client in clients))
         metrics_log["memory_saved"].append(sum(client.last_mem_saved for client in clients) / len(clients))
+
+        # Aggregate timing metrics (ms) if profiling is enabled; otherwise keep zeros.
+        if enable_profiling:
+            client_timing = [c.get_metrics() for c in clients]
+            def _avg(key: str) -> float:
+                vals = [m.get(key, 0.0) for m in client_timing]
+                return float(sum(vals) / len(vals)) if vals else 0.0
+
+            metrics_log["time_forward_ms"].append(_avg("time_forward_ms"))
+            metrics_log["time_backward_ms"].append(_avg("time_backward_ms"))
+            metrics_log["time_grad_norm_ms"].append(_avg("time_grad_norm_ms"))
+            metrics_log["time_controller_ms"].append(_avg("time_controller_ms"))
+            metrics_log["time_topk_ms"].append(_avg("time_topk_ms"))
+            metrics_log["time_quant_ms"].append(_avg("time_quant_ms"))
+            metrics_log["time_opt_step_ms"].append(_avg("time_opt_step_ms"))
+            metrics_log["time_delta_ms"].append(_avg("time_delta_ms"))
+            metrics_log["time_total_ms"].append(_avg("time_total_ms"))
+        else:
+            metrics_log["time_forward_ms"].append(0.0)
+            metrics_log["time_backward_ms"].append(0.0)
+            metrics_log["time_grad_norm_ms"].append(0.0)
+            metrics_log["time_controller_ms"].append(0.0)
+            metrics_log["time_topk_ms"].append(0.0)
+            metrics_log["time_quant_ms"].append(0.0)
+            metrics_log["time_opt_step_ms"].append(0.0)
+            metrics_log["time_delta_ms"].append(0.0)
+            metrics_log["time_total_ms"].append(0.0)
         
         # Get communication metrics from aggregator stats
         if isinstance(agg_stats, dict):
@@ -298,7 +399,50 @@ def federated_training(
         metrics_log["sparsity"].append(sum(client.last_sparsity for client in clients) / len(clients))
         metrics_log["skipped_batches"].append(total_skipped)
         metrics_log["effective_compute_ratio"].append(effective_compute_ratio)
-        metrics_log["compression_ratio"].append(model_size / upload_bytes if upload_bytes > 0 else 1.0)
+        if isinstance(agg_stats, dict) and "compression_ratio" in agg_stats:
+            metrics_log["compression_ratio"].append(float(agg_stats["compression_ratio"]))
+        else:
+            dense_upload_total = model_size * len(clients)
+            metrics_log["compression_ratio"].append(dense_upload_total / upload_bytes if upload_bytes > 0 else 1.0)
+
+        # Overhead-vs-savings derived metrics (per round)
+        dense_flops_ref = (
+            float(sum(getattr(c, "last_dense_flops_ref", 0.0) for c in clients) / len(clients))
+            if clients else 0.0
+        )
+        actual_flops = float(metrics_log["flops"][-1]) if metrics_log["flops"] else 0.0
+        saved_flops_est = max(0.0, dense_flops_ref - actual_flops)
+        saved_flops_ratio = (saved_flops_est / dense_flops_ref) if dense_flops_ref > 0 else 0.0
+
+        metrics_log["dense_flops_ref"].append(dense_flops_ref)
+        metrics_log["saved_flops_est"].append(saved_flops_est)
+        metrics_log["saved_flops_ratio"].append(saved_flops_ratio)
+
+        # Communication savings vs dense uplink (dense upload ~ model_size per client)
+        dense_upload_bytes_ref = float(model_size) * float(len(clients)) if clients else 0.0
+        saved_upload_bytes = max(0.0, float(dense_upload_bytes_ref) - float(upload_bytes))
+        saved_upload_ratio = (saved_upload_bytes / dense_upload_bytes_ref) if dense_upload_bytes_ref > 0 else 0.0
+
+        metrics_log["dense_upload_bytes_ref"].append(dense_upload_bytes_ref)
+        metrics_log["saved_upload_bytes"].append(saved_upload_bytes)
+        metrics_log["saved_upload_ratio"].append(saved_upload_ratio)
+
+        # Timing overhead percentages (meaningful only when enable_profiling=True)
+        t_total = float(metrics_log["time_total_ms"][-1]) if metrics_log["time_total_ms"] else 0.0
+        t_controller = float(metrics_log["time_controller_ms"][-1]) if metrics_log["time_controller_ms"] else 0.0
+        t_topk = float(metrics_log["time_topk_ms"][-1]) if metrics_log["time_topk_ms"] else 0.0
+
+        t_non_backprop = float(
+            (metrics_log["time_grad_norm_ms"][-1] if metrics_log["time_grad_norm_ms"] else 0.0)
+            + (metrics_log["time_controller_ms"][-1] if metrics_log["time_controller_ms"] else 0.0)
+            + (metrics_log["time_topk_ms"][-1] if metrics_log["time_topk_ms"] else 0.0)
+            + (metrics_log["time_quant_ms"][-1] if metrics_log["time_quant_ms"] else 0.0)
+            + (metrics_log["time_delta_ms"][-1] if metrics_log["time_delta_ms"] else 0.0)
+        )
+
+        metrics_log["controller_overhead_pct"].append((100.0 * t_controller / t_total) if t_total > 0 else 0.0)
+        metrics_log["topk_overhead_pct"].append((100.0 * t_topk / t_total) if t_total > 0 else 0.0)
+        metrics_log["non_backprop_overhead_pct"].append((100.0 * t_non_backprop / t_total) if t_total > 0 else 0.0)
         metrics_log["client_eval_history"].append(
             {cid: client.local_evaluate(client.test_loader) for cid, client in enumerate(clients)}
         )
@@ -372,17 +516,50 @@ def federated_training(
         compression_ratio = total_original_size / total_compressed_size if total_compressed_size > 0 else 1.0
         
         # Calculate average smoothed_phi across all clients
-        avg_smoothed_phi = sum(getattr(client, 'smoothed_phi', 0.0) for client in clients) / len(clients) if clients else 0.0
+        if clients:
+            smoothed_phi_vals = []
+            for client in clients:
+                v = getattr(client, 'smoothed_phi', 0.0)
+                if v is None:
+                    v = 0.0
+                smoothed_phi_vals.append(float(v))
+            avg_smoothed_phi = sum(smoothed_phi_vals) / len(smoothed_phi_vals)
+        else:
+            avg_smoothed_phi = 0.0
 
         # Update consolidated metrics with current timestamp
         current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         consolidated_metrics["timestamp"].append(current_timestamp)
         consolidated_metrics["round"].append(rnd + 1)
+        consolidated_metrics["method"].append(method)
         consolidated_metrics["accuracy"].append(acc)
         consolidated_metrics["flops"].append(sum(client.last_flops for client in clients) / len(clients))
         consolidated_metrics["memory"].append(max(client.last_mem for client in clients))
         consolidated_metrics["memory_saved"].append(sum(client.last_mem_saved for client in clients) / len(clients))
         consolidated_metrics["smoothed_phi"].append(avg_smoothed_phi)  # Add smoothed gradient-norm signal
+
+        # Mirror the timing breakdown to consolidated_metrics for convenience
+        consolidated_metrics["time_forward_ms"].append(metrics_log["time_forward_ms"][-1])
+        consolidated_metrics["time_backward_ms"].append(metrics_log["time_backward_ms"][-1])
+        consolidated_metrics["time_grad_norm_ms"].append(metrics_log["time_grad_norm_ms"][-1])
+        consolidated_metrics["time_controller_ms"].append(metrics_log["time_controller_ms"][-1])
+        consolidated_metrics["time_topk_ms"].append(metrics_log["time_topk_ms"][-1])
+        consolidated_metrics["time_quant_ms"].append(metrics_log["time_quant_ms"][-1])
+        consolidated_metrics["time_opt_step_ms"].append(metrics_log["time_opt_step_ms"][-1])
+        consolidated_metrics["time_delta_ms"].append(metrics_log["time_delta_ms"][-1])
+        consolidated_metrics["time_total_ms"].append(metrics_log["time_total_ms"][-1])
+
+        consolidated_metrics["dense_flops_ref"].append(metrics_log["dense_flops_ref"][-1])
+        consolidated_metrics["saved_flops_est"].append(metrics_log["saved_flops_est"][-1])
+        consolidated_metrics["saved_flops_ratio"].append(metrics_log["saved_flops_ratio"][-1])
+
+        consolidated_metrics["dense_upload_bytes_ref"].append(metrics_log["dense_upload_bytes_ref"][-1])
+        consolidated_metrics["saved_upload_bytes"].append(metrics_log["saved_upload_bytes"][-1])
+        consolidated_metrics["saved_upload_ratio"].append(metrics_log["saved_upload_ratio"][-1])
+
+        consolidated_metrics["controller_overhead_pct"].append(metrics_log["controller_overhead_pct"][-1])
+        consolidated_metrics["topk_overhead_pct"].append(metrics_log["topk_overhead_pct"][-1])
+        consolidated_metrics["non_backprop_overhead_pct"].append(metrics_log["non_backprop_overhead_pct"][-1])
         
         # Add SRAM and latency metrics
         try:
@@ -577,7 +754,16 @@ def federated_training(
                             # Check if the file has the correct structure
                             try:
                                 existing_df = pd.read_csv(csv_log_path, nrows=1)
-                                if 'client_id' in existing_df.columns:
+                                required_columns = [
+                                    "timestamp",
+                                    "round",
+                                    "client_id",
+                                ] + [k for k in metrics_log.keys() if k not in ("timestamp", "round")]
+
+                                if (
+                                    "client_id" in existing_df.columns
+                                    and all(col in existing_df.columns for col in required_columns)
+                                ):
                                     # File has correct structure, use it
                                     new_csv_path = csv_log_path
                                 else:
@@ -592,70 +778,76 @@ def federated_training(
                         # Ensure the directory exists
                         os.makedirs(os.path.dirname(new_csv_path), exist_ok=True)
                         
-                        # Create a DataFrame for all metrics (per-client and aggregated)
+                        # Build rows for all clients + one aggregated row.
+                        # Each client row includes its client-specific metrics, plus the same round-level
+                        # aggregated/derived metrics (latency, overhead %, dense refs/savings, etc.)
+                        # so this CSV can be analyzed without joining against the main per-round CSV.
+                        base_round_metrics = {k: metrics_log[k][-1] for k in metrics_log.keys() if metrics_log.get(k)}
+                        base_round_metrics.pop("timestamp", None)
+                        base_round_metrics.pop("round", None)
+
                         all_metrics = []
-                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        
-                        # Define column order explicitly
-                        columns = [
-                            "timestamp", "round", "client_id", "accuracy", "flops", "memory", 
-                            "memory_saved", "communication", "sparsity", "skipped_batches", 
-                            "download_bytes", "upload_bytes", "model_size_bytes", "compression_ratio"
-                        ]
-                        
-                        # Add per-client metrics
+                        timestamp = metrics_log["timestamp"][-1] if metrics_log.get("timestamp") else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        round_no = metrics_log["round"][-1] if metrics_log.get("round") else (rnd + 1)
+
+                        # Per-client rows
                         for client_idx, client in enumerate(clients):
                             client_metrics = client.get_metrics()
                             metrics_row = {
                                 "timestamp": timestamp,
-                                "round": rnd + 1,
+                                "round": round_no,
                                 "client_id": f"client_{client_idx}",
-                                "accuracy": client.local_evaluate(client.test_loader),
-                                "flops": client_metrics.get("flops", 0.0),
-                                "memory": client_metrics.get("memory", 0.0),
-                                "memory_saved": client_metrics.get("memory_saved", 0.0),
-                                "communication": client_metrics.get("communication", 0.0),
-                                "sparsity": client_metrics.get("sparsity", 0.0),
-                                "skipped_batches": client_metrics.get("skipped_batches", 0),
-                                "download_bytes": client_metrics.get("download_bytes", 0.0),
-                                "upload_bytes": client_metrics.get("upload_bytes", 0.0),
-                                "model_size_bytes": client_metrics.get("model_size_bytes", 0.0),
-                                "compression_ratio": client_metrics.get("compression_ratio", 1.0)
+                                **base_round_metrics,
                             }
+
+                            # Override round-level metrics with client-specific values
+                            metrics_row["accuracy"] = client.local_evaluate(client.test_loader)
+                            metrics_row["flops"] = client_metrics.get("flops", 0.0)
+                            metrics_row["memory"] = client_metrics.get("memory", 0.0)
+                            metrics_row["memory_saved"] = client_metrics.get("memory_saved", 0.0)
+                            metrics_row["communication"] = client_metrics.get("communication", 0.0)
+                            metrics_row["sparsity"] = client_metrics.get("sparsity", 0.0)
+                            metrics_row["skipped_batches"] = client_metrics.get("skipped_batches", 0)
+                            metrics_row["download_bytes"] = client_metrics.get("download_bytes", 0.0)
+                            metrics_row["upload_bytes"] = client_metrics.get("upload_bytes", 0.0)
+                            metrics_row["model_size_bytes"] = client_metrics.get("model_size_bytes", 0.0)
+                            metrics_row["compression_ratio"] = client_metrics.get("compression_ratio", 1.0)
+
+                            # If profiling is enabled, prefer per-client timing (more informative than round average)
+                            for k in [
+                                "time_forward_ms",
+                                "time_backward_ms",
+                                "time_grad_norm_ms",
+                                "time_controller_ms",
+                                "time_topk_ms",
+                                "time_quant_ms",
+                                "time_opt_step_ms",
+                                "time_delta_ms",
+                                "time_total_ms",
+                            ]:
+                                if k in client_metrics and client_metrics[k] is not None:
+                                    metrics_row[k] = client_metrics[k]
+
                             all_metrics.append(metrics_row)
-                        
-                        # Add aggregated metrics row
+
+                        # Aggregated row (keeps the round-level metrics values)
                         agg_row = {
                             "timestamp": timestamp,
-                            "round": rnd + 1,
+                            "round": round_no,
                             "client_id": "agg",
-                            "accuracy": agg_metrics.get("accuracy", 0.0),
-                            "flops": agg_metrics.get("flops", 0.0),
-                            "memory": agg_metrics.get("memory", 0.0),
-                            "memory_saved": agg_metrics.get("memory_saved", 0.0),
-                            "communication": agg_metrics.get("communication", 0.0),
-                            "sparsity": agg_metrics.get("sparsity", 0.0),
-                            "skipped_batches": agg_metrics.get("skipped_batches", 0),
-                            "download_bytes": agg_metrics.get("download_bytes", 0.0),
-                            "upload_bytes": agg_metrics.get("upload_bytes", 0.0),
-                            "model_size_bytes": agg_metrics.get("model_size_bytes", 0.0),
-                            "compression_ratio": agg_metrics.get("compression_ratio", 1.0),
-                            "effective_compute_ratio": agg_metrics.get("effective_compute_ratio", 1.0)
+                            **base_round_metrics,
                         }
                         all_metrics.append(agg_row)
-                        
-                        # Convert to DataFrame with explicit column order
+
+                        # Convert to DataFrame with a stable column order: client_id + the main per-round columns
                         df = pd.DataFrame(all_metrics)
-                        
-                        # Ensure client_id is the third column (after timestamp and round)
-                        if 'client_id' in df.columns:
-                            cols = df.columns.tolist()
-                            if 'timestamp' in cols and 'round' in cols:
-                                cols.remove('client_id')
-                                cols.remove('timestamp')
-                                cols.remove('round')
-                                # Reorder columns
-                                df = df[['timestamp', 'round', 'client_id'] + cols]
+
+                        required_columns = [
+                            "timestamp",
+                            "round",
+                            "client_id",
+                        ] + [k for k in metrics_log.keys() if k not in ("timestamp", "round")]
+                        df = df.reindex(columns=required_columns)
                         
                         # Check if file exists to determine if we need to write headers
                         file_exists = os.path.isfile(new_csv_path)
